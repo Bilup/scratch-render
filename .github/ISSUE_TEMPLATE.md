@@ -10,6 +10,6 @@ _Describe what actually happens_
 
 _Explain what someone needs to do in order to see what's described in *Actual behavior* above_
 
-### Operating System and Browser
+### Operating System and Browser 
 
 _e.g. Mac OS 10.11.6 Safari 10.0_
