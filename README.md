@@ -1,16 +1,16 @@
-# TurboWarp/scratch-render
+# Bilup/scratch-render
 
-scratch-render modified for use in [TurboWarp](https://turbowarp.org/). We've optimized some operations and added a lot of options.
+scratch-render modified for use in [Bilup](https://bilup.org/). We've optimized some operations and added a lot of options.
 
 ## Setup
 
-See https://github.com/TurboWarp/scratch-gui/wiki/Getting-Started to setup the complete TurboWarp environment.
+See https://docs.bilup.org/development/getting-started to setup the complete Bilup environment.
 
 If you just want to play with the render then it's the same process as upstream scratch-render.
 
 ## API
 
-Public APIs are compatible with a vanilla scratch-render. TurboWarp/scratch-render is a drop-in replacement for scratch-render.
+Public APIs are compatible with a vanilla scratch-render. Bilup/scratch-render is a drop-in replacement for scratch-render.
 
 Notable public API additions include:
 
