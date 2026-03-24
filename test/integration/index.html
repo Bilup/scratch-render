@@ -23,6 +23,6 @@
             ...data,
         });
 
-        window.loadFile = loadFileInputIntoVM.bind(null, document.getElementById('file'), vm, render);
+        const loadFile = loadFileInputIntoVM.bind(null, document.getElementById('file'), vm, render);
     </script>
 </body>
