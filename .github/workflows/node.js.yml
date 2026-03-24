@@ -20,11 +20,11 @@ jobs:
       - run: npm run lint
       - run: npm run build
     # Save dist as artifact
-    - name: Upload dist
-      uses: actions/upload-artifact@v4
-      with:
-        name: dist
-        path: dist
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
 
   deploy:
     runs-on: ubuntu-latest
