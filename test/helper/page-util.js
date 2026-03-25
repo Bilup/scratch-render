@@ -47,7 +47,6 @@ window.initVM = render => {
 
     vm.attachStorage(storage);
     vm.attachRenderer(render);
-    vm.attachV2SVGAdapter(ScratchSVGRenderer.V2SVGAdapter);
     vm.attachV2BitmapAdapter(new ScratchSVGRenderer.BitmapAdapter());
 
     return vm;
