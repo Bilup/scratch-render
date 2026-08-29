@@ -1,3 +1,5 @@
+/* eslint-disable object-curly-spacing */
+/* eslint-disable space-before-function-paren */
 const EventEmitter = require('events');
 
 const hull = require('@turbowarp/ancient-hull.js');
@@ -19,9 +21,13 @@ const log = require('./util/log');
 
 const __isTouchingDrawablesPoint = twgl.v3.create();
 const __candidatesBounds = new Rectangle();
+const __touchingBounds = new Rectangle();
+const __candidateBounds = new Rectangle();
 const __fenceBounds = new Rectangle();
 const __touchingColor = new Uint8ClampedArray(4);
 const __blendColor = new Uint8ClampedArray(4);
+const __drawableScale = [0, 0];
+const __projectionUniforms = {u_projectionMatrix: null};
 
 // More pixels than this and we give up to the GPU and take the cost of readPixels
 // Width * Height * Number of drawables at location
@@ -193,6 +199,8 @@ class RenderWebGL extends EventEmitter {
         /** @type {Array<int>} */
         this._drawList = [];
 
+        this._intersectionPool = [];
+
         // A list of layer group names in the order they should appear
         // from furthest back to furthest in front.
         /** @type {Array<String>} */
@@ -220,6 +228,9 @@ class RenderWebGL extends EventEmitter {
 
         /** @type {ShaderManager} */
         this._shaderManager = new ShaderManager(gl);
+
+        // Texture filtering is texture state, so only update it when the requested mode changes.
+        this._textureFilterModes = new WeakMap();
 
         /** @type {any} */
         this._regionId = null;
@@ -462,6 +473,7 @@ class RenderWebGL extends EventEmitter {
      * @param {int} yTop The top edge's y-coordinate. Scratch 2 uses 180.
      */
     setStageSize (xLeft, xRight, yBottom, yTop) {
+        this.dirty = true;
         this._xLeft = xLeft;
         this._xRight = xRight;
         this._yBottom = yBottom;
@@ -884,24 +896,9 @@ class RenderWebGL extends EventEmitter {
         if (oldIndex < endIndex) {
             if (order === 0) return oldIndex;
 
-            if (useRealLayers) {
-                delete this._drawList[oldIndex];
-            } else {
-                this._drawList.splice(oldIndex, 1);
-            }
-
             let newIndex = order;
             if (optIsRelative) {
                 newIndex += oldIndex;
-
-                if (order > 0 && useRealLayers && newIndex < this._drawList.length) {
-                    if (newIndex in this._drawList) {
-                        const temp = this._drawList[newIndex];
-                        this._drawList[newIndex] = drawableID;
-                        this._drawList[oldIndex] = temp;
-                        return newIndex;
-                    }
-                }
             }
 
             const possibleMin = (optMin || 0) + startIndex;
@@ -909,16 +906,32 @@ class RenderWebGL extends EventEmitter {
             newIndex = Math.max(newIndex, min);
 
             if (useRealLayers) {
-                if (newIndex >= this._drawList.length) {
-                    this._drawList.length++;
+                // A drawable's slot in the draw list is its layer, so the list is allowed to be
+                // sparse and may hold more layers than there are drawables. Shift the drawables
+                // we move past by one rather than splicing, which would renumber every layer
+                // above this one and grow the list on every call.
+                if (!Number.isFinite(newIndex)) {
+                    // "go to front": the first free slot above the topmost occupied one. The
+                    // drawable being moved doesn't count, or repeated calls would climb forever.
+                    let top = startIndex - 1;
+                    for (let i = startIndex; i < this._drawList.length; i++) {
+                        if (i !== oldIndex && typeof this._drawList[i] !== 'undefined') top = i;
+                    }
+                    newIndex = top + 1;
                 }
 
-                if (typeof this._drawList[newIndex] === 'undefined') {
-                    this._drawList[newIndex] = drawableID;
+                if (newIndex >= this._drawList.length) {
+                    // Above every occupied slot, so there is nothing to shift past.
+                    delete this._drawList[oldIndex];
                 } else {
-                    this._drawList.splice(newIndex, 0, drawableID);
+                    const step = newIndex > oldIndex ? 1 : -1;
+                    for (let i = oldIndex; i !== newIndex; i += step) {
+                        this._drawList[i] = this._drawList[i + step];
+                    }
                 }
+                this._drawList[newIndex] = drawableID;
             } else {
+                this._drawList.splice(oldIndex, 1);
                 newIndex = Math.min(newIndex, endIndex);
                 this._drawList.splice(newIndex, 0, drawableID);
             }
@@ -930,13 +943,8 @@ class RenderWebGL extends EventEmitter {
     }
 
     skinWasAltered (skin) {
-        // This is very hot function.
-        for (let i = 0; i < this._drawList.length; i++) {
-            const drawableId = this._drawList[i];
-            const drawable = this._allDrawables[drawableId];
-            if (drawable._skin === skin) {
-                drawable._skinWasAltered();
-            }
+        for (const drawable of skin.attachedDrawables) {
+            drawable._skinWasAltered();
         }
     }
 
@@ -1111,7 +1119,8 @@ class RenderWebGL extends EventEmitter {
 
         // if there are just too many pixels to CPU render efficiently, we need to let readPixels happen
         if (bounds.width * bounds.height * (candidates.length + 1) >= maxPixelsForCPU) {
-            this._isTouchingColorGpuStart(drawableID, candidates.map(({id}) => id).reverse(), bounds, color3b, mask3b);
+            const result = candidates.map(({ id }) => id).reverse();
+            this._isTouchingColorGpuStart(drawableID, result, bounds, color3b, mask3b);
         }
 
         const drawable = this._allDrawables[drawableID];
@@ -1236,7 +1245,7 @@ class RenderWebGL extends EventEmitter {
 
             // Draw the candidate drawables on top of the background.
             this._drawThese(candidateIDs, ShaderManager.DRAW_MODE.default, projection,
-                {idFilterFunc: testID => testID !== drawableID}
+                { filter: testID => testID !== drawableID, skipCulling: true }
             );
         } finally {
             gl.colorMask(true, true, true, true);
@@ -1281,15 +1290,10 @@ class RenderWebGL extends EventEmitter {
             return false;
         }
 
-        const candidates = this._candidatesTouching(drawableID,
-            // even if passed an invisible drawable, we will NEVER touch it!
-            candidateIDs.filter(id => this._allDrawables[id]._visible));
+        const candidates = this._candidatesTouching(drawableID, candidateIDs);
         if (candidates.length === 0) {
             return false;
         }
-
-        // Get the union of all the candidates intersections.
-        const bounds = this._candidatesBounds(candidates);
 
         const drawable = this._allDrawables[drawableID];
         const point = __isTouchingDrawablesPoint;
@@ -1298,16 +1302,16 @@ class RenderWebGL extends EventEmitter {
 
         // This is an EXTREMELY brute force collision detector, but it is
         // still faster than asking the GPU to give us the pixels.
-        for (let x = bounds.left; x <= bounds.right; x++) {
-            // Scratch Space - +y is top
-            point[0] = x;
-            for (let y = bounds.bottom; y <= bounds.top; y++) {
-                point[1] = y;
-                if (drawable.isTouching(point)) {
-                    for (let index = 0; index < candidates.length; index++) {
-                        if (candidates[index].drawable.isTouching(point)) {
-                            return true;
-                        }
+        for (let index = 0; index < candidates.length; index++) {
+            const candidate = candidates[index].drawable;
+            const intersection = candidates[index].intersection;
+            for (let x = intersection.left; x <= intersection.right; x++) {
+                // Scratch Space - +y is top
+                point[0] = x;
+                for (let y = intersection.bottom; y <= intersection.top; y++) {
+                    point[1] = y;
+                    if (drawable.isTouching(point) && candidate.isTouching(point)) {
+                        return true;
                     }
                 }
             }
@@ -1663,7 +1667,7 @@ class RenderWebGL extends EventEmitter {
         /** @todo remove this once URL-based skin setting is removed. */
         if (!drawable.skin || !drawable.skin.getTexture([100, 100])) return null;
 
-        const bounds = drawable.getFastBounds();
+        const bounds = drawable.getFastBounds(__touchingBounds);
 
         // Limit queries to the stage size.
         if (!this.offscreenTouching) {
@@ -1694,11 +1698,13 @@ class RenderWebGL extends EventEmitter {
         if (bounds === null) {
             return result;
         }
+        const pool = this._intersectionPool;
         // iterate through the drawables list BACKWARDS - we want the top most item to be the first we check
         for (let index = candidateIDs.length - 1; index >= 0; index--) {
             const id = candidateIDs[index];
             if (id !== drawableID) {
                 const drawable = this._allDrawables[id];
+                if (!drawable) continue;
                 // Text bubbles aren't considered in "touching" queries
                 if (drawable.skin instanceof TextBubbleSkin) continue;
                 if (drawable.skin && drawable._visible) {
@@ -1706,9 +1712,7 @@ class RenderWebGL extends EventEmitter {
                     // contents of a private skin.
                     if (!this.allowPrivateSkinAccess && drawable.skin.private) continue;
 
-                    // Update the CPU position data
-                    drawable.updateCPURenderAttributes();
-                    const candidateBounds = drawable.getFastBounds();
+                    const candidateBounds = drawable.getFastBounds(__candidateBounds);
 
                     // Push bounds out to integers. If a drawable extends out into half a pixel, that half-pixel still
                     // needs to be tested. Plus, in some areas we construct another rectangle from the union of these,
@@ -1717,10 +1721,15 @@ class RenderWebGL extends EventEmitter {
                     candidateBounds.snapToInt();
 
                     if (bounds.intersects(candidateBounds)) {
+                        // Update the CPU position data
+                        drawable.updateCPURenderAttributes();
+                        if (result.length >= pool.length) {
+                            pool.push(new Rectangle());
+                        }
                         result.push({
                             id,
                             drawable,
-                            intersection: Rectangle.intersect(bounds, candidateBounds)
+                            intersection: Rectangle.intersect(bounds, candidateBounds, pool[result.length])
                         });
                     }
                 }
@@ -1986,12 +1995,9 @@ class RenderWebGL extends EventEmitter {
         bounds.top *= quality;
         bounds.bottom *= quality;
         bounds.snapToInt();
-        gl.viewport(
-            (this._nativeSize[0] * 0.5 * quality) + bounds.left,
-            (this._nativeSize[1] * 0.5 * quality) - bounds.top,
-            bounds.width,
-            bounds.height
-        );
+        const viewportX = (this._nativeSize[0] * 0.5 * quality) + bounds.left;
+        const viewportY = (this._nativeSize[1] * 0.5 * quality) - bounds.top;
+        gl.viewport(viewportX, viewportY, bounds.width, bounds.height);
         const projection = twgl.m4.ortho(
             // TW: We have to convert the snapped "screen-space" back to "stage-space" for rendering.
             bounds.left / quality,
@@ -2008,7 +2014,12 @@ class RenderWebGL extends EventEmitter {
             framebufferWidth: this._nativeSize[0] * quality,
             framebufferHeight: this._nativeSize[1] * quality
         });
-        skin._silhouetteDirty = true;
+        skin._markSilhouetteDirty(
+            viewportX,
+            viewportX + bounds.width,
+            viewportY,
+            viewportY + bounds.height
+        );
         this.dirty = true;
     }
 
@@ -2134,6 +2145,9 @@ class RenderWebGL extends EventEmitter {
         const gl = this._gl;
         let currentShader = null;
 
+        gl.activeTexture(gl.TEXTURE0);
+        if (gl.bindSampler) gl.bindSampler(0, null);
+
         const framebufferSpaceScaleDiffers = (
             'framebufferWidth' in opts && 'framebufferHeight' in opts &&
             opts.framebufferWidth !== this._nativeSize[0] && opts.framebufferHeight !== this._nativeSize[1]
@@ -2154,24 +2168,25 @@ class RenderWebGL extends EventEmitter {
             // the ignoreVisibility flag is used (e.g. for stamping or touchingColor).
             if (!drawable.getVisible() && !opts.ignoreVisibility) continue;
 
+            // Skip drawables with no skin.
+            const skin = drawable.skin;
+            if (!skin) continue;
+
+            // Skip private skins, if requested.
+            if (opts.skipPrivateSkins && skin.private) continue;
+
             // drawableScale is the "framebuffer-pixel-space" scale of the drawable, as percentages of the drawable's
             // "native size" (so 100 = same as skin's "native size", 200 = twice "native size").
             // If the framebuffer dimensions are the same as the stage's "native" size, there's no need to calculate it.
-            const drawableScale = framebufferSpaceScaleDiffers ? [
-                drawable.scale[0] * opts.framebufferWidth / this._nativeSize[0],
-                drawable.scale[1] * opts.framebufferHeight / this._nativeSize[1]
-            ] : drawable.scale;
+            let drawableScale = drawable._scale;
+            if (framebufferSpaceScaleDiffers) {
+                __drawableScale[0] = drawableScale[0] * opts.framebufferWidth / this._nativeSize[0];
+                __drawableScale[1] = drawableScale[1] * opts.framebufferHeight / this._nativeSize[1];
+                drawableScale = __drawableScale;
+            }
 
-            // Skip drawables with no skin.
-            if (!drawable.skin) continue;
-
-            // Skip private skins, if requested.
-            if (opts.skipPrivateSkins && drawable.skin.private) continue;
-
-            // Skip drawables with a skin that does not have a texture.
-            if (!drawable.skin.getTexture(drawableScale)) continue;
-
-            const uniforms = {};
+            const texture = skin.getTexture(drawableScale);
+            if (!texture) continue;
 
             let effectBits = drawable.enabledEffects;
             effectBits &= Object.prototype.hasOwnProperty.call(opts, 'effectMask') ? opts.effectMask : effectBits;
@@ -2186,33 +2201,37 @@ class RenderWebGL extends EventEmitter {
                 currentShader = newShader;
                 gl.useProgram(currentShader.program);
                 twgl.setBuffersAndAttributes(gl, currentShader, this._bufferInfo);
-                Object.assign(uniforms, {
-                    u_projectionMatrix: projection
-                });
+                gl.uniform1i(currentShader.uniformSetters.u_skin.location, 0);
+                __projectionUniforms.u_projectionMatrix = projection;
+                twgl.setUniforms(currentShader, __projectionUniforms);
             }
 
-            Object.assign(uniforms,
-                drawable.skin.getUniforms(drawableScale),
-                drawable.getUniforms());
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            this._setTextureFilter(texture,
+                skin.useNearest(drawableScale, drawable) ? gl.NEAREST : gl.LINEAR);
+
+            twgl.setUniforms(currentShader, drawable.getUniforms());
+
+            const skinSizeSetter = currentShader.uniformSetters.u_skinSize;
+            if (skinSizeSetter) skinSizeSetter(skin.size);
 
             // Apply extra uniforms after the Drawable's, to allow overwriting.
             if (opts.extraUniforms) {
-                Object.assign(uniforms, opts.extraUniforms);
+                twgl.setUniforms(currentShader, opts.extraUniforms);
             }
 
-            if (uniforms.u_skin) {
-                twgl.setTextureParameters(
-                    gl, uniforms.u_skin, {
-                        minMag: drawable.skin.useNearest(drawableScale, drawable) ? gl.NEAREST : gl.LINEAR
-                    }
-                );
-            }
-
-            twgl.setUniforms(currentShader, uniforms);
-            twgl.drawBufferInfo(gl, this._bufferInfo, gl.TRIANGLES);
+            gl.drawArrays(gl.TRIANGLES, 0, this._bufferInfo.numElements);
         }
 
         this._regionId = null;
+    }
+
+    _setTextureFilter(texture, filter) {
+        if (this._textureFilterModes.get(texture) === filter) return;
+        const gl = this._gl;
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+        this._textureFilterModes.set(texture, filter);
     }
 
     /**
@@ -2267,6 +2286,7 @@ class RenderWebGL extends EventEmitter {
 
         const _pixelPos = twgl.v3.create();
         const _effectPos = twgl.v3.create();
+        const hasEffects = drawable.enabledEffects !== 0;
 
         let currentPoint;
 
@@ -2279,8 +2299,8 @@ class RenderWebGL extends EventEmitter {
             let x = 0;
             for (; x < width; x++) {
                 _pixelPos[0] = x / width;
-                EffectTransform.transformPoint(drawable, _pixelPos, _effectPos);
-                if (drawable.skin.isTouchingLinear(_effectPos)) {
+                if (drawable.skin.isTouchingLinear(hasEffects ?
+                    EffectTransform.transformPoint(drawable, _pixelPos, _effectPos) : _pixelPos)) {
                     currentPoint = [x, y];
                     break;
                 }
@@ -2316,8 +2336,8 @@ class RenderWebGL extends EventEmitter {
             // Now we repeat the process for the right side, looking leftwards for a pixel.
             for (x = width - 1; x >= 0; x--) {
                 _pixelPos[0] = x / width;
-                EffectTransform.transformPoint(drawable, _pixelPos, _effectPos);
-                if (drawable.skin.isTouchingLinear(_effectPos)) {
+                if (drawable.skin.isTouchingLinear(hasEffects ?
+                    EffectTransform.transformPoint(drawable, _pixelPos, _effectPos) : _pixelPos)) {
                     currentPoint = [x, y];
                     break;
                 }
@@ -2367,12 +2387,12 @@ class RenderWebGL extends EventEmitter {
 
         let blendAlpha = 1;
         for (let index = 0; blendAlpha !== 0 && index < drawables.length; index++) {
-            /*
-            if (left > vec[0] || right < vec[0] ||
-                bottom > vec[1] || top < vec[0]) {
+            const {intersection} = drawables[index];
+            if (intersection && (
+                intersection.left > vec[0] || intersection.right < vec[0] ||
+                intersection.bottom > vec[1] || intersection.top < vec[1])) {
                 continue;
             }
-            */
             Drawable.sampleColor4b(vec, drawables[index].drawable, __blendColor);
             // Equivalent to gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
             dst[0] += __blendColor[0] * blendAlpha;
