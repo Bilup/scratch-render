@@ -18416,6 +18416,8 @@ var log = __webpack_require__(/*! ./util/log */ "./src/util/log.js");
  * @type {twgl.v3}
  */
 var __isTouchingPosition = twgl.v3.create();
+var __hullProjection = twgl.m4.ortho(-1, 1, -1, 1, -1, 1);
+var __hullTransform = twgl.m4.identity();
 var FLOATING_POINT_ERROR_ALLOWANCE = 1e-6;
 
 /**
@@ -19057,11 +19059,10 @@ var Drawable = function () {
                 return this._transformedHullPoints;
             }
 
-            var projection = twgl.m4.ortho(-1, 1, -1, 1, -1, 1);
             var skinSize = this.skin.size;
             var halfXPixel = 1 / skinSize[0] / 2;
             var halfYPixel = 1 / skinSize[1] / 2;
-            var tm = twgl.m4.multiply(this._uniforms.u_modelMatrix, projection);
+            var tm = twgl.m4.multiply(this._uniforms.u_modelMatrix, __hullProjection, __hullTransform);
             for (var i = 0; i < this._convexHullPoints.length; i++) {
                 var point = this._convexHullPoints[i];
                 var dstPoint = this._transformedHullPoints[i];
@@ -19167,7 +19168,13 @@ var Drawable = function () {
         ,
         set: function set(newSkin) {
             if (this._skin !== newSkin) {
+                if (this._skin) {
+                    this._skin.attachedDrawables.delete(this);
+                }
                 this._skin = newSkin;
+                if (newSkin) {
+                    newSkin.attachedDrawables.add(this);
+                }
                 this._skinWasAltered();
             }
         }
@@ -19564,6 +19571,14 @@ var PenSkin = function (_Skin) {
         /** @type {ImageData} */
         _this._silhouetteImageData = null;
 
+        _this._dirtyLeft = 0;
+        _this._dirtyRight = 0;
+        _this._dirtyBottom = 0;
+        _this._dirtyTop = 0;
+
+        /** @type {Uint8Array} */
+        _this._partialSilhouettePixels = null;
+
         /** @type {object} */
         _this._lineOnBufferDrawRegionId = {
             enter: function enter() {
@@ -19596,6 +19611,12 @@ var PenSkin = function (_Skin) {
         var NO_EFFECTS = 0;
         /** @type {twgl.ProgramInfo} */
         _this._lineShader = _this._renderer._shaderManager.getShader(ShaderManager.DRAW_MODE.line, NO_EFFECTS);
+
+        /** @type {twgl.ProgramInfo} */
+        _this._triangleShader = _this._renderer._shaderManager.getShader(ShaderManager.DRAW_MODE.background, NO_EFFECTS);
+        _this._triangle_glbuffer = gl.createBuffer();
+        _this._triangle_loc = gl.getAttribLocation(_this._triangleShader.program, 'a_position');
+        _this._triangle_vertices = new Float32Array(6);
 
         // Draw region used to preserve texture when resizing
         _this._drawTextureShader = _this._renderer._shaderManager.getShader(ShaderManager.DRAW_MODE.default, NO_EFFECTS);
@@ -19722,7 +19743,23 @@ var PenSkin = function (_Skin) {
             gl.clearColor(0, 0, 0, 0);
             gl.clear(gl.COLOR_BUFFER_BIT);
 
-            this._silhouetteDirty = true;
+            this._markSilhouetteDirty(0, this._size[0], 0, this._size[1]);
+        }
+    }, {
+        key: '_markSilhouetteDirty',
+        value: function _markSilhouetteDirty(left, right, bottom, top) {
+            if (this._silhouetteDirty) {
+                this._dirtyLeft = Math.min(this._dirtyLeft, left);
+                this._dirtyRight = Math.max(this._dirtyRight, right);
+                this._dirtyBottom = Math.min(this._dirtyBottom, bottom);
+                this._dirtyTop = Math.max(this._dirtyTop, top);
+            } else {
+                this._silhouetteDirty = true;
+                this._dirtyLeft = left;
+                this._dirtyRight = right;
+                this._dirtyBottom = bottom;
+                this._dirtyTop = top;
+            }
         }
 
         /**
@@ -19754,8 +19791,6 @@ var PenSkin = function (_Skin) {
         value: function drawTriangle(penAttributes, x0, y0, x1, y1, x2, y2) {
             // Apply renderQuality similarly to lines
             this._drawTriangleOnBuffer(penAttributes, x0 * this.renderQuality, y0 * this.renderQuality, x1 * this.renderQuality, y1 * this.renderQuality, x2 * this.renderQuality, y2 * this.renderQuality);
-
-            this._silhouetteDirty = true;
         }
 
         /**
@@ -19776,8 +19811,6 @@ var PenSkin = function (_Skin) {
             var offset = diameter === 1 || diameter === 3 ? 0.5 : 0;
 
             this._drawLineOnBuffer(penAttributes, x0 + offset, y0 + offset, x1 + offset, y1 + offset);
-
-            this._silhouetteDirty = true;
         }
 
         /**
@@ -19929,6 +19962,11 @@ var PenSkin = function (_Skin) {
             // tw: apply renderQuality
             var lineThickness = (penAttributes.diameter || DefaultPenAttributes.diameter) * this.renderQuality;
 
+            var dirtyRadius = lineThickness * 0.5 + 2;
+            var halfWidth = this._size[0] * 0.5;
+            var halfHeight = this._size[1] * 0.5;
+            this._markSilhouetteDirty(halfWidth + Math.min(x0, x1) - dirtyRadius, halfWidth + Math.max(x0, x1) + dirtyRadius, halfHeight - Math.max(y0, y1) - dirtyRadius, halfHeight - Math.min(y0, y1) + dirtyRadius);
+
             for (var i = 0; i < iters; i++) {
                 // Pen color sent to the GPU is pre-multiplied by transparency
                 this.attribute_data[this.attribute_index] = penColor[0] * penColor[3];
@@ -19978,7 +20016,7 @@ var PenSkin = function (_Skin) {
 
             gl.viewport(0, 0, width, height);
 
-            var shader = this._renderer._shaderManager.getShader(ShaderManager.DRAW_MODE.background, 0);
+            var shader = this._triangleShader;
             gl.useProgram(shader.program);
 
             gl.enable(gl.BLEND);
@@ -19991,20 +20029,17 @@ var PenSkin = function (_Skin) {
                 u_backgroundColor: color
             });
 
-            var toBackgroundPositionX = function toBackgroundPositionX(x) {
-                return x / width;
-            };
-            var toBackgroundPositionY = function toBackgroundPositionY(y) {
-                return -y / height;
-            };
+            var vertices = this._triangle_vertices;
+            vertices[0] = x1 / width;
+            vertices[1] = -y1 / height;
+            vertices[2] = x2 / width;
+            vertices[3] = -y2 / height;
+            vertices[4] = x3 / width;
+            vertices[5] = -y3 / height;
 
-            var vertices = new Float32Array([toBackgroundPositionX(x1), toBackgroundPositionY(y1), toBackgroundPositionX(x2), toBackgroundPositionY(y2), toBackgroundPositionX(x3), toBackgroundPositionY(y3)]);
-
-            var buffer = gl.createBuffer();
-            gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+            var loc = this._triangle_loc;
+            gl.bindBuffer(gl.ARRAY_BUFFER, this._triangle_glbuffer);
             gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STREAM_DRAW);
-
-            var loc = gl.getAttribLocation(shader.program, 'a_position');
             gl.enableVertexAttribArray(loc);
             gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
 
@@ -20012,8 +20047,7 @@ var PenSkin = function (_Skin) {
 
             gl.disableVertexAttribArray(loc);
             gl.bindBuffer(gl.ARRAY_BUFFER, null);
-            gl.deleteBuffer(buffer);
-            this._silhouetteDirty = true;
+            this._markSilhouetteDirty(width * 0.5 + Math.min(x1, x2, x3) - 2, width * 0.5 + Math.max(x1, x2, x3) + 2, height * 0.5 - Math.max(y1, y2, y3) - 2, height * 0.5 - Math.min(y1, y2, y3) + 2);
         }
     }, {
         key: '_flushLines',
@@ -20048,7 +20082,6 @@ var PenSkin = function (_Skin) {
             }
 
             this.attribute_index = 0;
-            this._silhouetteDirty = true;
         }
 
         /**
@@ -20124,10 +20157,10 @@ var PenSkin = function (_Skin) {
                 this._drawPenTexture(oldTexture);
             }
 
-            this._silhouettePixels = new Uint8Array(Math.floor(width * height * 4));
             this._silhouetteImageData = new ImageData(width, height);
+            this._silhouettePixels = new Uint8Array(this._silhouetteImageData.data.buffer);
 
-            this._silhouetteDirty = true;
+            this._markSilhouetteDirty(0, width, 0, height);
         }
 
         // tw: sets the "quality" of the pen skin
@@ -20151,12 +20184,31 @@ var PenSkin = function (_Skin) {
         key: 'updateSilhouette',
         value: function updateSilhouette() {
             if (this._silhouetteDirty) {
+                var width = this._size[0];
+                var height = this._size[1];
+                var left = Math.max(0, Math.floor(this._dirtyLeft));
+                var right = Math.min(width, Math.ceil(this._dirtyRight));
+                var bottom = Math.max(0, Math.floor(this._dirtyBottom));
+                var top = Math.min(height, Math.ceil(this._dirtyTop));
+
                 this._renderer.enterDrawRegion(this._usePenBufferDrawRegionId);
                 // Sample the framebuffer's pixels into the silhouette instance
                 var gl = this._renderer.gl;
-                gl.readPixels(0, 0, this._size[0], this._size[1], gl.RGBA, gl.UNSIGNED_BYTE, this._silhouettePixels);
+                if (left === 0 && bottom === 0 && right === width && top === height) {
+                    gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, this._silhouettePixels);
+                } else if (right > left && top > bottom) {
+                    var dirtyWidth = right - left;
+                    var dirtyHeight = top - bottom;
+                    var requiredLength = dirtyWidth * dirtyHeight * 4;
+                    if (!this._partialSilhouettePixels || this._partialSilhouettePixels.length < requiredLength) {
+                        this._partialSilhouettePixels = new Uint8Array(requiredLength);
+                    }
+                    gl.readPixels(left, bottom, dirtyWidth, dirtyHeight, gl.RGBA, gl.UNSIGNED_BYTE, this._partialSilhouettePixels);
+                    for (var row = 0; row < dirtyHeight; row++) {
+                        this._silhouettePixels.set(this._partialSilhouettePixels.subarray(row * dirtyWidth * 4, (row + 1) * dirtyWidth * 4), ((bottom + row) * width + left) * 4);
+                    }
+                }
 
-                this._silhouetteImageData.data.set(this._silhouettePixels);
                 this._silhouette.update(this._silhouetteImageData, true /* isPremultiplied */);
 
                 this._silhouetteDirty = false;
@@ -20494,6 +20546,8 @@ function _possibleConstructorReturn(self, call) { if (!self) { throw new Referen
 
 function _inherits(subClass, superClass) { if (typeof superClass !== "function" && superClass !== null) { throw new TypeError("Super expression must either be null or a function, not " + typeof superClass); } subClass.prototype = Object.create(superClass && superClass.prototype, { constructor: { value: subClass, enumerable: false, writable: true, configurable: true } }); if (superClass) Object.setPrototypeOf ? Object.setPrototypeOf(subClass, superClass) : subClass.__proto__ = superClass; }
 
+/* eslint-disable object-curly-spacing */
+/* eslint-disable space-before-function-paren */
 var EventEmitter = __webpack_require__(/*! events */ "./node_modules/events/events.js");
 
 var hull = __webpack_require__(/*! @turbowarp/ancient-hull.js */ "./node_modules/@turbowarp/ancient-hull.js/src/hull.js");
@@ -20515,9 +20569,13 @@ var log = __webpack_require__(/*! ./util/log */ "./src/util/log.js");
 
 var __isTouchingDrawablesPoint = twgl.v3.create();
 var __candidatesBounds = new Rectangle();
+var __touchingBounds = new Rectangle();
+var __candidateBounds = new Rectangle();
 var __fenceBounds = new Rectangle();
 var __touchingColor = new Uint8ClampedArray(4);
 var __blendColor = new Uint8ClampedArray(4);
+var __drawableScale = [0, 0];
+var __projectionUniforms = { u_projectionMatrix: null };
 
 // More pixels than this and we give up to the GPU and take the cost of readPixels
 // Width * Height * Number of drawables at location
@@ -20694,6 +20752,8 @@ var RenderWebGL = function (_EventEmitter) {
         /** @type {Array<int>} */
         _this._drawList = [];
 
+        _this._intersectionPool = [];
+
         // A list of layer group names in the order they should appear
         // from furthest back to furthest in front.
         /** @type {Array<String>} */
@@ -20721,6 +20781,9 @@ var RenderWebGL = function (_EventEmitter) {
 
         /** @type {ShaderManager} */
         _this._shaderManager = new ShaderManager(gl);
+
+        // Texture filtering is texture state, so only update it when the requested mode changes.
+        _this._textureFilterModes = new WeakMap();
 
         /** @type {any} */
         _this._regionId = null;
@@ -21008,6 +21071,7 @@ var RenderWebGL = function (_EventEmitter) {
     }, {
         key: 'setStageSize',
         value: function setStageSize(xLeft, xRight, yBottom, yTop) {
+            this.dirty = true;
             this._xLeft = xLeft;
             this._xRight = xRight;
             this._yBottom = yBottom;
@@ -21542,24 +21606,9 @@ var RenderWebGL = function (_EventEmitter) {
             if (oldIndex < endIndex) {
                 if (order === 0) return oldIndex;
 
-                if (useRealLayers) {
-                    delete this._drawList[oldIndex];
-                } else {
-                    this._drawList.splice(oldIndex, 1);
-                }
-
                 var newIndex = order;
                 if (optIsRelative) {
                     newIndex += oldIndex;
-
-                    if (order > 0 && useRealLayers && newIndex < this._drawList.length) {
-                        if (newIndex in this._drawList) {
-                            var temp = this._drawList[newIndex];
-                            this._drawList[newIndex] = drawableID;
-                            this._drawList[oldIndex] = temp;
-                            return newIndex;
-                        }
-                    }
                 }
 
                 var possibleMin = (optMin || 0) + startIndex;
@@ -21567,16 +21616,32 @@ var RenderWebGL = function (_EventEmitter) {
                 newIndex = Math.max(newIndex, min);
 
                 if (useRealLayers) {
-                    if (newIndex >= this._drawList.length) {
-                        this._drawList.length++;
+                    // A drawable's slot in the draw list is its layer, so the list is allowed to be
+                    // sparse and may hold more layers than there are drawables. Shift the drawables
+                    // we move past by one rather than splicing, which would renumber every layer
+                    // above this one and grow the list on every call.
+                    if (!Number.isFinite(newIndex)) {
+                        // "go to front": the first free slot above the topmost occupied one. The
+                        // drawable being moved doesn't count, or repeated calls would climb forever.
+                        var top = startIndex - 1;
+                        for (var i = startIndex; i < this._drawList.length; i++) {
+                            if (i !== oldIndex && typeof this._drawList[i] !== 'undefined') top = i;
+                        }
+                        newIndex = top + 1;
                     }
 
-                    if (typeof this._drawList[newIndex] === 'undefined') {
-                        this._drawList[newIndex] = drawableID;
+                    if (newIndex >= this._drawList.length) {
+                        // Above every occupied slot, so there is nothing to shift past.
+                        delete this._drawList[oldIndex];
                     } else {
-                        this._drawList.splice(newIndex, 0, drawableID);
+                        var step = newIndex > oldIndex ? 1 : -1;
+                        for (var _i = oldIndex; _i !== newIndex; _i += step) {
+                            this._drawList[_i] = this._drawList[_i + step];
+                        }
                     }
+                    this._drawList[newIndex] = drawableID;
                 } else {
+                    this._drawList.splice(oldIndex, 1);
                     newIndex = Math.min(newIndex, endIndex);
                     this._drawList.splice(newIndex, 0, drawableID);
                 }
@@ -21589,12 +21654,28 @@ var RenderWebGL = function (_EventEmitter) {
     }, {
         key: 'skinWasAltered',
         value: function skinWasAltered(skin) {
-            // This is very hot function.
-            for (var i = 0; i < this._drawList.length; i++) {
-                var drawableId = this._drawList[i];
-                var drawable = this._allDrawables[drawableId];
-                if (drawable._skin === skin) {
+            var _iteratorNormalCompletion4 = true;
+            var _didIteratorError4 = false;
+            var _iteratorError4 = undefined;
+
+            try {
+                for (var _iterator4 = skin.attachedDrawables[Symbol.iterator](), _step4; !(_iteratorNormalCompletion4 = (_step4 = _iterator4.next()).done); _iteratorNormalCompletion4 = true) {
+                    var drawable = _step4.value;
+
                     drawable._skinWasAltered();
+                }
+            } catch (err) {
+                _didIteratorError4 = true;
+                _iteratorError4 = err;
+            } finally {
+                try {
+                    if (!_iteratorNormalCompletion4 && _iterator4.return) {
+                        _iterator4.return();
+                    }
+                } finally {
+                    if (_didIteratorError4) {
+                        throw _iteratorError4;
+                    }
                 }
             }
         }
@@ -21778,10 +21859,11 @@ var RenderWebGL = function (_EventEmitter) {
 
             // if there are just too many pixels to CPU render efficiently, we need to let readPixels happen
             if (bounds.width * bounds.height * (candidates.length + 1) >= maxPixelsForCPU) {
-                this._isTouchingColorGpuStart(drawableID, candidates.map(function (_ref) {
+                var result = candidates.map(function (_ref) {
                     var id = _ref.id;
                     return id;
-                }).reverse(), bounds, color3b, mask3b);
+                }).reverse();
+                this._isTouchingColorGpuStart(drawableID, result, bounds, color3b, mask3b);
             }
 
             var drawable = this._allDrawables[drawableID];
@@ -21901,9 +21983,9 @@ var RenderWebGL = function (_EventEmitter) {
                 twgl.drawBufferInfo(gl, this._bufferInfo, gl.TRIANGLES);
 
                 // Draw the candidate drawables on top of the background.
-                this._drawThese(candidateIDs, ShaderManager.DRAW_MODE.default, projection, { idFilterFunc: function idFilterFunc(testID) {
+                this._drawThese(candidateIDs, ShaderManager.DRAW_MODE.default, projection, { filter: function filter(testID) {
                         return testID !== drawableID;
-                    } });
+                    }, skipCulling: true });
             } finally {
                 gl.colorMask(true, true, true, true);
                 gl.disable(gl.STENCIL_TEST);
@@ -21946,8 +22028,6 @@ var RenderWebGL = function (_EventEmitter) {
     }, {
         key: 'isTouchingDrawables',
         value: function isTouchingDrawables(drawableID) {
-            var _this2 = this;
-
             var candidateIDs = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : this._drawList;
 
             // if we are invisible we don't touch anything.
@@ -21955,17 +22035,10 @@ var RenderWebGL = function (_EventEmitter) {
                 return false;
             }
 
-            var candidates = this._candidatesTouching(drawableID,
-            // even if passed an invisible drawable, we will NEVER touch it!
-            candidateIDs.filter(function (id) {
-                return _this2._allDrawables[id]._visible;
-            }));
+            var candidates = this._candidatesTouching(drawableID, candidateIDs);
             if (candidates.length === 0) {
                 return false;
             }
-
-            // Get the union of all the candidates intersections.
-            var bounds = this._candidatesBounds(candidates);
 
             var drawable = this._allDrawables[drawableID];
             var point = __isTouchingDrawablesPoint;
@@ -21974,16 +22047,16 @@ var RenderWebGL = function (_EventEmitter) {
 
             // This is an EXTREMELY brute force collision detector, but it is
             // still faster than asking the GPU to give us the pixels.
-            for (var x = bounds.left; x <= bounds.right; x++) {
-                // Scratch Space - +y is top
-                point[0] = x;
-                for (var y = bounds.bottom; y <= bounds.top; y++) {
-                    point[1] = y;
-                    if (drawable.isTouching(point)) {
-                        for (var index = 0; index < candidates.length; index++) {
-                            if (candidates[index].drawable.isTouching(point)) {
-                                return true;
-                            }
+            for (var index = 0; index < candidates.length; index++) {
+                var candidate = candidates[index].drawable;
+                var intersection = candidates[index].intersection;
+                for (var x = intersection.left; x <= intersection.right; x++) {
+                    // Scratch Space - +y is top
+                    point[0] = x;
+                    for (var y = intersection.bottom; y <= intersection.top; y++) {
+                        point[1] = y;
+                        if (drawable.isTouching(point) && candidate.isTouching(point)) {
+                            return true;
                         }
                     }
                 }
@@ -22092,7 +22165,7 @@ var RenderWebGL = function (_EventEmitter) {
     }, {
         key: 'pick',
         value: function pick(centerX, centerY, touchWidth, touchHeight, candidateIDs) {
-            var _this3 = this;
+            var _this2 = this;
 
             var bounds = this.clientSpaceToScratchBounds(centerX, centerY, touchWidth, touchHeight);
             if (bounds.left === -Infinity || bounds.bottom === -Infinity) {
@@ -22100,7 +22173,7 @@ var RenderWebGL = function (_EventEmitter) {
             }
 
             candidateIDs = (candidateIDs || this._drawList).filter(function (id) {
-                var drawable = _this3._allDrawables[id];
+                var drawable = _this2._allDrawables[id];
                 if (!candidateIDs && !drawable.interactive) {
                     return false;
                 }
@@ -22340,7 +22413,7 @@ var RenderWebGL = function (_EventEmitter) {
             /** @todo remove this once URL-based skin setting is removed. */
             if (!drawable.skin || !drawable.skin.getTexture([100, 100])) return null;
 
-            var bounds = drawable.getFastBounds();
+            var bounds = drawable.getFastBounds(__touchingBounds);
 
             // Limit queries to the stage size.
             if (!this.offscreenTouching) {
@@ -22374,11 +22447,13 @@ var RenderWebGL = function (_EventEmitter) {
             if (bounds === null) {
                 return result;
             }
+            var pool = this._intersectionPool;
             // iterate through the drawables list BACKWARDS - we want the top most item to be the first we check
             for (var index = candidateIDs.length - 1; index >= 0; index--) {
                 var id = candidateIDs[index];
                 if (id !== drawableID) {
                     var drawable = this._allDrawables[id];
+                    if (!drawable) continue;
                     // Text bubbles aren't considered in "touching" queries
                     if (drawable.skin instanceof TextBubbleSkin) continue;
                     if (drawable.skin && drawable._visible) {
@@ -22386,9 +22461,7 @@ var RenderWebGL = function (_EventEmitter) {
                         // contents of a private skin.
                         if (!this.allowPrivateSkinAccess && drawable.skin.private) continue;
 
-                        // Update the CPU position data
-                        drawable.updateCPURenderAttributes();
-                        var candidateBounds = drawable.getFastBounds();
+                        var candidateBounds = drawable.getFastBounds(__candidateBounds);
 
                         // Push bounds out to integers. If a drawable extends out into half a pixel, that half-pixel still
                         // needs to be tested. Plus, in some areas we construct another rectangle from the union of these,
@@ -22397,10 +22470,15 @@ var RenderWebGL = function (_EventEmitter) {
                         candidateBounds.snapToInt();
 
                         if (bounds.intersects(candidateBounds)) {
+                            // Update the CPU position data
+                            drawable.updateCPURenderAttributes();
+                            if (result.length >= pool.length) {
+                                pool.push(new Rectangle());
+                            }
                             result.push({
                                 id: id,
                                 drawable: drawable,
-                                intersection: Rectangle.intersect(bounds, candidateBounds)
+                                intersection: Rectangle.intersect(bounds, candidateBounds, pool[result.length])
                             });
                         }
                     }
@@ -22709,7 +22787,9 @@ var RenderWebGL = function (_EventEmitter) {
             bounds.top *= quality;
             bounds.bottom *= quality;
             bounds.snapToInt();
-            gl.viewport(this._nativeSize[0] * 0.5 * quality + bounds.left, this._nativeSize[1] * 0.5 * quality - bounds.top, bounds.width, bounds.height);
+            var viewportX = this._nativeSize[0] * 0.5 * quality + bounds.left;
+            var viewportY = this._nativeSize[1] * 0.5 * quality - bounds.top;
+            gl.viewport(viewportX, viewportY, bounds.width, bounds.height);
             var projection = twgl.m4.ortho(
             // TW: We have to convert the snapped "screen-space" back to "stage-space" for rendering.
             bounds.left / quality, bounds.right / quality, bounds.top / quality, bounds.bottom / quality, -1, 1);
@@ -22720,7 +22800,7 @@ var RenderWebGL = function (_EventEmitter) {
                 framebufferWidth: this._nativeSize[0] * quality,
                 framebufferHeight: this._nativeSize[1] * quality
             });
-            skin._silhouetteDirty = true;
+            skin._markSilhouetteDirty(viewportX, viewportX + bounds.width, viewportY, viewportY + bounds.height);
             this.dirty = true;
         }
 
@@ -22852,6 +22932,9 @@ var RenderWebGL = function (_EventEmitter) {
             var gl = this._gl;
             var currentShader = null;
 
+            gl.activeTexture(gl.TEXTURE0);
+            if (gl.bindSampler) gl.bindSampler(0, null);
+
             var framebufferSpaceScaleDiffers = 'framebufferWidth' in opts && 'framebufferHeight' in opts && opts.framebufferWidth !== this._nativeSize[0] && opts.framebufferHeight !== this._nativeSize[1];
 
             var numDrawables = drawables.length;
@@ -22869,21 +22952,25 @@ var RenderWebGL = function (_EventEmitter) {
                 // the ignoreVisibility flag is used (e.g. for stamping or touchingColor).
                 if (!drawable.getVisible() && !opts.ignoreVisibility) continue;
 
+                // Skip drawables with no skin.
+                var skin = drawable.skin;
+                if (!skin) continue;
+
+                // Skip private skins, if requested.
+                if (opts.skipPrivateSkins && skin.private) continue;
+
                 // drawableScale is the "framebuffer-pixel-space" scale of the drawable, as percentages of the drawable's
                 // "native size" (so 100 = same as skin's "native size", 200 = twice "native size").
                 // If the framebuffer dimensions are the same as the stage's "native" size, there's no need to calculate it.
-                var drawableScale = framebufferSpaceScaleDiffers ? [drawable.scale[0] * opts.framebufferWidth / this._nativeSize[0], drawable.scale[1] * opts.framebufferHeight / this._nativeSize[1]] : drawable.scale;
+                var drawableScale = drawable._scale;
+                if (framebufferSpaceScaleDiffers) {
+                    __drawableScale[0] = drawableScale[0] * opts.framebufferWidth / this._nativeSize[0];
+                    __drawableScale[1] = drawableScale[1] * opts.framebufferHeight / this._nativeSize[1];
+                    drawableScale = __drawableScale;
+                }
 
-                // Skip drawables with no skin.
-                if (!drawable.skin) continue;
-
-                // Skip private skins, if requested.
-                if (opts.skipPrivateSkins && drawable.skin.private) continue;
-
-                // Skip drawables with a skin that does not have a texture.
-                if (!drawable.skin.getTexture(drawableScale)) continue;
-
-                var uniforms = {};
+                var texture = skin.getTexture(drawableScale);
+                if (!texture) continue;
 
                 var effectBits = drawable.enabledEffects;
                 effectBits &= Object.prototype.hasOwnProperty.call(opts, 'effectMask') ? opts.effectMask : effectBits;
@@ -22898,29 +22985,37 @@ var RenderWebGL = function (_EventEmitter) {
                     currentShader = newShader;
                     gl.useProgram(currentShader.program);
                     twgl.setBuffersAndAttributes(gl, currentShader, this._bufferInfo);
-                    Object.assign(uniforms, {
-                        u_projectionMatrix: projection
-                    });
+                    gl.uniform1i(currentShader.uniformSetters.u_skin.location, 0);
+                    __projectionUniforms.u_projectionMatrix = projection;
+                    twgl.setUniforms(currentShader, __projectionUniforms);
                 }
 
-                Object.assign(uniforms, drawable.skin.getUniforms(drawableScale), drawable.getUniforms());
+                gl.bindTexture(gl.TEXTURE_2D, texture);
+                this._setTextureFilter(texture, skin.useNearest(drawableScale, drawable) ? gl.NEAREST : gl.LINEAR);
+
+                twgl.setUniforms(currentShader, drawable.getUniforms());
+
+                var skinSizeSetter = currentShader.uniformSetters.u_skinSize;
+                if (skinSizeSetter) skinSizeSetter(skin.size);
 
                 // Apply extra uniforms after the Drawable's, to allow overwriting.
                 if (opts.extraUniforms) {
-                    Object.assign(uniforms, opts.extraUniforms);
+                    twgl.setUniforms(currentShader, opts.extraUniforms);
                 }
 
-                if (uniforms.u_skin) {
-                    twgl.setTextureParameters(gl, uniforms.u_skin, {
-                        minMag: drawable.skin.useNearest(drawableScale, drawable) ? gl.NEAREST : gl.LINEAR
-                    });
-                }
-
-                twgl.setUniforms(currentShader, uniforms);
-                twgl.drawBufferInfo(gl, this._bufferInfo, gl.TRIANGLES);
+                gl.drawArrays(gl.TRIANGLES, 0, this._bufferInfo.numElements);
             }
 
             this._regionId = null;
+        }
+    }, {
+        key: '_setTextureFilter',
+        value: function _setTextureFilter(texture, filter) {
+            if (this._textureFilterModes.get(texture) === filter) return;
+            var gl = this._gl;
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+            this._textureFilterModes.set(texture, filter);
         }
 
         /**
@@ -22982,6 +23077,7 @@ var RenderWebGL = function (_EventEmitter) {
 
             var _pixelPos = twgl.v3.create();
             var _effectPos = twgl.v3.create();
+            var hasEffects = drawable.enabledEffects !== 0;
 
             var currentPoint = void 0;
 
@@ -22994,8 +23090,7 @@ var RenderWebGL = function (_EventEmitter) {
                 var x = 0;
                 for (; x < width; x++) {
                     _pixelPos[0] = x / width;
-                    EffectTransform.transformPoint(drawable, _pixelPos, _effectPos);
-                    if (drawable.skin.isTouchingLinear(_effectPos)) {
+                    if (drawable.skin.isTouchingLinear(hasEffects ? EffectTransform.transformPoint(drawable, _pixelPos, _effectPos) : _pixelPos)) {
                         currentPoint = [x, y];
                         break;
                     }
@@ -23031,8 +23126,7 @@ var RenderWebGL = function (_EventEmitter) {
                 // Now we repeat the process for the right side, looking leftwards for a pixel.
                 for (x = width - 1; x >= 0; x--) {
                     _pixelPos[0] = x / width;
-                    EffectTransform.transformPoint(drawable, _pixelPos, _effectPos);
-                    if (drawable.skin.isTouchingLinear(_effectPos)) {
+                    if (drawable.skin.isTouchingLinear(hasEffects ? EffectTransform.transformPoint(drawable, _pixelPos, _effectPos) : _pixelPos)) {
                         currentPoint = [x, y];
                         break;
                     }
@@ -23085,12 +23179,11 @@ var RenderWebGL = function (_EventEmitter) {
 
             var blendAlpha = 1;
             for (var index = 0; blendAlpha !== 0 && index < drawables.length; index++) {
-                /*
-                if (left > vec[0] || right < vec[0] ||
-                    bottom > vec[1] || top < vec[0]) {
+                var intersection = drawables[index].intersection;
+
+                if (intersection && (intersection.left > vec[0] || intersection.right < vec[0] || intersection.bottom > vec[1] || intersection.top < vec[1])) {
                     continue;
                 }
-                */
                 Drawable.sampleColor4b(vec, drawables[index].drawable, __blendColor);
                 // Equivalent to gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA)
                 dst[0] += __blendColor[0] * blendAlpha;
@@ -23154,27 +23247,27 @@ var RenderWebGL = function (_EventEmitter) {
             // first time. We want to avoid that, so we'll ask the browser to load them right away.
             if ((typeof document === 'undefined' ? 'undefined' : _typeof(document)) === 'object' && _typeof(document.fonts) === 'object' && typeof document.fonts.load === 'function') {
                 var families = Object.keys(customFonts);
-                var _iteratorNormalCompletion4 = true;
-                var _didIteratorError4 = false;
-                var _iteratorError4 = undefined;
+                var _iteratorNormalCompletion5 = true;
+                var _didIteratorError5 = false;
+                var _iteratorError5 = undefined;
 
                 try {
-                    for (var _iterator4 = families[Symbol.iterator](), _step4; !(_iteratorNormalCompletion4 = (_step4 = _iterator4.next()).done); _iteratorNormalCompletion4 = true) {
-                        var family = _step4.value;
+                    for (var _iterator5 = families[Symbol.iterator](), _step5; !(_iteratorNormalCompletion5 = (_step5 = _iterator5.next()).done); _iteratorNormalCompletion5 = true) {
+                        var family = _step5.value;
 
                         document.fonts.load('12px ' + family);
                     }
                 } catch (err) {
-                    _didIteratorError4 = true;
-                    _iteratorError4 = err;
+                    _didIteratorError5 = true;
+                    _iteratorError5 = err;
                 } finally {
                     try {
-                        if (!_iteratorNormalCompletion4 && _iterator4.return) {
-                            _iterator4.return();
+                        if (!_iteratorNormalCompletion5 && _iterator5.return) {
+                            _iterator5.return();
                         }
                     } finally {
-                        if (_didIteratorError4) {
-                            throw _iteratorError4;
+                        if (_didIteratorError5) {
+                            throw _iteratorError5;
                         }
                     }
                 }
@@ -23198,10 +23291,10 @@ var RenderWebGL = function (_EventEmitter) {
     }, {
         key: '_visibleDrawList',
         get: function get() {
-            var _this4 = this;
+            var _this3 = this;
 
             return this._drawList.filter(function (id) {
-                return _this4._allDrawables[id]._visible;
+                return _this3._allDrawables[id]._visible;
             });
         }
     }]);
@@ -24192,6 +24285,12 @@ var Skin = function () {
      * Whether this skin might include private information about the user.
      */
     this.private = false;
+
+    /**
+     * Drawables currently using this skin, maintained by the Drawable skin setter.
+     * @type {Set<Drawable>}
+     */
+    this.attachedDrawables = new Set();
   }
 
   /**
