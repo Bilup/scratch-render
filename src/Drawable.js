@@ -152,6 +152,69 @@ class Drawable {
     }
 
     /**
+     * Reset this Drawable's state for reuse in the object pool.
+     * Preserves _id and _renderer which are set at creation time.
+     * Resets all mutable state to constructor defaults.
+     */
+    resetForPool () {
+        // Reset uniforms
+        this._uniforms.u_modelMatrix = twgl.m4.identity();
+        this._uniforms.u_silhouetteColor = Drawable.color4fFromID(this._id);
+
+        // Reset effect uniforms
+        const numEffects = ShaderManager.EFFECTS.length;
+        for (let index = 0; index < numEffects; ++index) {
+            const effectName = ShaderManager.EFFECTS[index];
+            const effectInfo = ShaderManager.EFFECT_INFO[effectName];
+            const converter = effectInfo.converter;
+            this._uniforms[effectInfo.uniformName] = converter(0);
+        }
+
+        // Reset position, scale, direction
+        this._position[0] = 0;
+        this._position[1] = 0;
+        this._scale[0] = 100;
+        this._scale[1] = 100;
+        this._direction = 90;
+
+        // Reset transform matrices
+        this._transformDirty = true;
+        this._rotationMatrix = twgl.m4.identity();
+        this._rotationTransformDirty = true;
+        this._rotationAdjusted[0] = 0;
+        this._rotationAdjusted[1] = 0;
+        this._rotationCenterDirty = true;
+        this._skinScale[0] = 0;
+        this._skinScale[1] = 0;
+        this._skinScale[2] = 0;
+        this._skinScaleDirty = true;
+        this._inverseMatrix = twgl.m4.identity();
+        this._inverseTransformDirty = true;
+
+        // Reset visibility
+        this._visible = true;
+
+        // Reset effects
+        this.enabledEffects = 0;
+
+        // Reset convex hull
+        this._convexHullPoints = null;
+        this._convexHullDirty = true;
+        this._transformedHullPoints = null;
+        this._transformedHullDirty = true;
+
+        // Reset touching function
+        this.isTouching = this._isTouchingNever;
+
+        // Reset quality and interaction
+        this._highQuality = false;
+        this.interactive = true;
+
+        // Disconnect from any skin
+        this.skin = null;
+    }
+
+    /**
      * Mark this Drawable's transform as dirty.
      * It will be recalculated next time it's needed.
      */

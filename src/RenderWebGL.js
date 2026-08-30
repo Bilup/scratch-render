@@ -201,6 +201,14 @@ class RenderWebGL extends EventEmitter {
 
         this._intersectionPool = [];
 
+        /**
+         * tw: Drawable object pool. Reuses Drawable instances to reduce GC pressure
+         * when clones are frequently created and destroyed.
+         * Each entry is a drawableID that is available for reuse.
+         * @type {Array<number>}
+         */
+        this._drawablePool = [];
+
         // A list of layer group names in the order they should appear
         // from furthest back to furthest in front.
         /** @type {Array<String>} */
@@ -718,6 +726,17 @@ class RenderWebGL extends EventEmitter {
             log.warn('Cannot create a drawable without a known layer group');
             return;
         }
+
+        // Try to reuse a drawable from the pool
+        const pooledID = this._drawablePool.pop();
+        if (typeof pooledID !== 'undefined') {
+            const drawable = this._allDrawables[pooledID];
+            drawable.resetForPool();
+            drawable.setHighQuality(this.useHighQualityRender);
+            this._addToDrawList(pooledID, group);
+            return pooledID;
+        }
+
         const drawableID = this._nextDrawableId++;
         const drawable = new Drawable(drawableID, this);
         this._allDrawables[drawableID] = drawable;
@@ -825,7 +844,6 @@ class RenderWebGL extends EventEmitter {
         this.dirty = true;
         const drawable = this._allDrawables[drawableID];
         drawable.dispose();
-        delete this._allDrawables[drawableID];
 
         const currentLayerGroup = this._layerGroups[group];
         const endIndex = this._endIndexForKnownLayerGroup(currentLayerGroup);
@@ -843,6 +861,14 @@ class RenderWebGL extends EventEmitter {
         } else {
             log.warn('Could not destroy drawable that could not be found in layer group.');
             return;
+        }
+
+        // tw: return drawable to the pool for reuse, reducing GC pressure
+        // Limit pool size to prevent unbounded memory growth
+        if (this._drawablePool.length < 500) {
+            this._drawablePool.push(drawableID);
+        } else {
+            delete this._allDrawables[drawableID];
         }
     }
 
