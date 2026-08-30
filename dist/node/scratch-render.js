@@ -944,6 +944,72 @@ var Drawable = function () {
         }
 
         /**
+         * Reset this Drawable's state for reuse in the object pool.
+         * Preserves _id and _renderer which are set at creation time.
+         * Resets all mutable state to constructor defaults.
+         */
+
+    }, {
+        key: 'resetForPool',
+        value: function resetForPool() {
+            // Reset uniforms
+            this._uniforms.u_modelMatrix = twgl.m4.identity();
+            this._uniforms.u_silhouetteColor = Drawable.color4fFromID(this._id);
+
+            // Reset effect uniforms
+            var numEffects = ShaderManager.EFFECTS.length;
+            for (var index = 0; index < numEffects; ++index) {
+                var effectName = ShaderManager.EFFECTS[index];
+                var effectInfo = ShaderManager.EFFECT_INFO[effectName];
+                var converter = effectInfo.converter;
+                this._uniforms[effectInfo.uniformName] = converter(0);
+            }
+
+            // Reset position, scale, direction
+            this._position[0] = 0;
+            this._position[1] = 0;
+            this._scale[0] = 100;
+            this._scale[1] = 100;
+            this._direction = 90;
+
+            // Reset transform matrices
+            this._transformDirty = true;
+            this._rotationMatrix = twgl.m4.identity();
+            this._rotationTransformDirty = true;
+            this._rotationAdjusted[0] = 0;
+            this._rotationAdjusted[1] = 0;
+            this._rotationCenterDirty = true;
+            this._skinScale[0] = 0;
+            this._skinScale[1] = 0;
+            this._skinScale[2] = 0;
+            this._skinScaleDirty = true;
+            this._inverseMatrix = twgl.m4.identity();
+            this._inverseTransformDirty = true;
+
+            // Reset visibility
+            this._visible = true;
+
+            // Reset effects
+            this.enabledEffects = 0;
+
+            // Reset convex hull
+            this._convexHullPoints = null;
+            this._convexHullDirty = true;
+            this._transformedHullPoints = null;
+            this._transformedHullDirty = true;
+
+            // Reset touching function
+            this.isTouching = this._isTouchingNever;
+
+            // Reset quality and interaction
+            this._highQuality = false;
+            this.interactive = true;
+
+            // Disconnect from any skin
+            this.skin = null;
+        }
+
+        /**
          * Mark this Drawable's transform as dirty.
          * It will be recalculated next time it's needed.
          */
@@ -3137,6 +3203,14 @@ var RenderWebGL = function (_EventEmitter) {
 
         _this._intersectionPool = [];
 
+        /**
+         * tw: Drawable object pool. Reuses Drawable instances to reduce GC pressure
+         * when clones are frequently created and destroyed.
+         * Each entry is a drawableID that is available for reuse.
+         * @type {Array<number>}
+         */
+        _this._drawablePool = [];
+
         // A list of layer group names in the order they should appear
         // from furthest back to furthest in front.
         /** @type {Array<String>} */
@@ -3789,6 +3863,17 @@ var RenderWebGL = function (_EventEmitter) {
                 log.warn('Cannot create a drawable without a known layer group');
                 return;
             }
+
+            // Try to reuse a drawable from the pool
+            var pooledID = this._drawablePool.pop();
+            if (typeof pooledID !== 'undefined') {
+                var _drawable = this._allDrawables[pooledID];
+                _drawable.resetForPool();
+                _drawable.setHighQuality(this.useHighQualityRender);
+                this._addToDrawList(pooledID, group);
+                return pooledID;
+            }
+
             var drawableID = this._nextDrawableId++;
             var drawable = new Drawable(drawableID, this);
             this._allDrawables[drawableID] = drawable;
@@ -3912,7 +3997,6 @@ var RenderWebGL = function (_EventEmitter) {
             this.dirty = true;
             var drawable = this._allDrawables[drawableID];
             drawable.dispose();
-            delete this._allDrawables[drawableID];
 
             var currentLayerGroup = this._layerGroups[group];
             var endIndex = this._endIndexForKnownLayerGroup(currentLayerGroup);
@@ -3930,6 +4014,14 @@ var RenderWebGL = function (_EventEmitter) {
             } else {
                 log.warn('Could not destroy drawable that could not be found in layer group.');
                 return;
+            }
+
+            // tw: return drawable to the pool for reuse, reducing GC pressure
+            // Limit pool size to prevent unbounded memory growth
+            if (this._drawablePool.length < 500) {
+                this._drawablePool.push(drawableID);
+            } else {
+                delete this._allDrawables[drawableID];
             }
         }
 
