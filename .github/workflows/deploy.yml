@@ -21,8 +21,12 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      # package-lock.json 中的 git 依赖以 git+ssh:// 形式记录，统一改写为 HTTPS，
+      # 保证依赖克隆不依赖 runner 的 SSH 配置。
+      - name: Use HTTPS for git dependencies
+        run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --no-audit --no-fund --loglevel verbose
       - name: Build playground
         run: npm run build
       - name: Build docs
