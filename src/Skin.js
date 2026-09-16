@@ -172,7 +172,10 @@ class Skin {
     _setTexture (textureData) {
         const gl = this._renderer.gl;
 
-        gl.bindTexture(gl.TEXTURE_2D, this._texture);
+        // Go through the renderer so its record of what is bound to texture unit
+        // 0 stays accurate; a skin uploads its texture mid-draw when a MIP is
+        // created lazily.
+        this._renderer._bindTexture(this._texture);
         // Premultiplied alpha is necessary for proper blending.
         // See http://www.realtimerendering.com/blog/gpus-prefer-premultiplication/
         gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);

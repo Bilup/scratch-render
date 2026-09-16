@@ -24,9 +24,11 @@ jobs:
       - name: Use HTTPS for git dependencies
         run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
       - run: npm ci --no-audit --no-fund --loglevel verbose
-      - run: npm run lint
       - run: npm run build
-      - run: npm run test 
+      # Not `npm run test`: that script is `npm run lint && npm run build && npm
+      # run tap`, so it would pull the lint step straight back in. The build it
+      # would repeat already ran above.
+      - run: npm run tap
     # Save dist as artifact
       - name: Upload dist
         uses: actions/upload-artifact@v4

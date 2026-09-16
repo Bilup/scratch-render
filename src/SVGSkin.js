@@ -140,6 +140,10 @@ class SVGSkin extends Skin {
         };
 
         const mip = twgl.createTexture(this._renderer.gl, textureOptions);
+        // createTexture binds the new texture to the active texture unit without
+        // going through the renderer, and MIPs are created lazily during a draw,
+        // so the renderer's record of what is bound is now stale.
+        this._renderer._invalidateBoundTexture();
 
         // Check if this is the largest MIP created so far. Currently, silhouettes only get scaled up.
         if (isLargestMIP) {

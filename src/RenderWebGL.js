@@ -34,6 +34,26 @@ const __projectionUniforms = {u_projectionMatrix: null};
 const __cpuTouchingColorPixelCount = 4e4;
 
 /**
+ * Whether two uniform values are the same, for the purpose of skipping a
+ * redundant upload. Uniform values are numbers or small numeric arrays.
+ * @param {*} a One uniform value.
+ * @param {*} b The other uniform value.
+ * @returns {boolean} True if uploading `b` would be redundant.
+ */
+const uniformValuesEqual = (a, b) => {
+    if (a === b) return true;
+    if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) {
+        return false;
+    }
+    const length = a.length;
+    if (length !== b.length) return false;
+    for (let i = 0; i < length; i++) {
+        if (a[i] !== b[i]) return false;
+    }
+    return true;
+};
+
+/**
  * @callback RenderWebGL#idFilterFunc
  * @param {int} drawableID The ID to filter.
  * @return {bool} True if the ID passes the filter, otherwise false.
@@ -239,6 +259,16 @@ class RenderWebGL extends EventEmitter {
 
         // Texture filtering is texture state, so only update it when the requested mode changes.
         this._textureFilterModes = new WeakMap();
+
+        // Which texture is bound to texture unit 0, so that re-binding the same
+        // one (every clone of a sprite shares it) can be skipped. null means
+        // "unknown", never "nothing bound".
+        this._boundTexture = null;
+
+        // Last uploaded value of each uniform on the currently bound program, so
+        // that uploading an unchanged value can be skipped. Cleared whenever the
+        // program changes; see _setDrawableUniforms.
+        this._uniformValueCache = new Map();
 
         /** @type {any} */
         this._regionId = null;
@@ -1693,7 +1723,11 @@ class RenderWebGL extends EventEmitter {
         /** @todo remove this once URL-based skin setting is removed. */
         if (!drawable.skin || !drawable.skin.getTexture([100, 100])) return null;
 
-        const bounds = drawable.getFastBounds(__touchingBounds);
+        // Take a copy of the cached bounds: the clamping and snapping below
+        // write to the rectangle, and the cache is read-only.
+        const cachedBounds = drawable.getCachedFastBounds();
+        const bounds = __touchingBounds;
+        bounds.initFromBounds(cachedBounds.left, cachedBounds.right, cachedBounds.bottom, cachedBounds.top);
 
         // Limit queries to the stage size.
         if (!this.offscreenTouching) {
@@ -1738,24 +1772,50 @@ class RenderWebGL extends EventEmitter {
                     // contents of a private skin.
                     if (!this.allowPrivateSkinAccess && drawable.skin.private) continue;
 
-                    const candidateBounds = drawable.getFastBounds(__candidateBounds);
+                    // Was getFastBounds(__candidateBounds): rescanning the
+                    // candidate's transformed hull points for every query is the
+                    // single largest cost of a touching check. The result only
+                    // changes when the candidate's transform or hull does, so
+                    // read the cached copy instead.
+                    const cachedBounds = drawable.getCachedFastBounds();
 
                     // Push bounds out to integers. If a drawable extends out into half a pixel, that half-pixel still
                     // needs to be tested. Plus, in some areas we construct another rectangle from the union of these,
                     // and iterate over its pixels (width * height). Turns out that doesn't work so well when the
                     // width/height aren't integers.
-                    candidateBounds.snapToInt();
+                    //
+                    // Snapping into locals and intersecting inline, rather than
+                    // writing a scratch Rectangle and calling intersects(),
+                    // keeps the common case - a candidate nowhere near the query
+                    // - down to four rounding operations and four comparisons.
+                    // The scratch rectangle is only filled in once we know it
+                    // intersects, exactly as before.
+                    const candidateLeft = Math.floor(cachedBounds.left);
+                    const candidateRight = Math.ceil(cachedBounds.right);
+                    const candidateBottom = Math.floor(cachedBounds.bottom);
+                    const candidateTop = Math.ceil(cachedBounds.top);
 
-                    if (bounds.intersects(candidateBounds)) {
+                    if (
+                        bounds.left <= candidateRight &&
+                        candidateLeft <= bounds.right &&
+                        bounds.top >= candidateBottom &&
+                        candidateTop >= bounds.bottom
+                    ) {
                         // Update the CPU position data
                         drawable.updateCPURenderAttributes();
                         if (result.length >= pool.length) {
                             pool.push(new Rectangle());
                         }
+                        __candidateBounds.initFromBounds(
+                            candidateLeft,
+                            candidateRight,
+                            candidateBottom,
+                            candidateTop
+                        );
                         result.push({
                             id,
                             drawable,
-                            intersection: Rectangle.intersect(bounds, candidateBounds, pool[result.length])
+                            intersection: Rectangle.intersect(bounds, __candidateBounds, pool[result.length])
                         });
                     }
                 }
@@ -2173,6 +2233,10 @@ class RenderWebGL extends EventEmitter {
 
         gl.activeTexture(gl.TEXTURE0);
         if (gl.bindSampler) gl.bindSampler(0, null);
+        // Anything outside this method may have bound a texture to unit 0 in the
+        // meantime (a lazily created MIP, a new skin), so start from unknown and
+        // rebuild the knowledge as we go.
+        this._boundTexture = null;
 
         const framebufferSpaceScaleDiffers = (
             'framebufferWidth' in opts && 'framebufferHeight' in opts &&
@@ -2230,13 +2294,19 @@ class RenderWebGL extends EventEmitter {
                 gl.uniform1i(currentShader.uniformSetters.u_skin.location, 0);
                 __projectionUniforms.u_projectionMatrix = projection;
                 twgl.setUniforms(currentShader, __projectionUniforms);
+
+                // Uniform values live on the program, and we are the only writer
+                // while this program is bound, so the cache describes exactly
+                // this program. A different program may hold nothing, so start
+                // over rather than assume our values carried across.
+                this._uniformValueCache.clear();
             }
 
-            gl.bindTexture(gl.TEXTURE_2D, texture);
+            this._bindTexture(texture);
             this._setTextureFilter(texture,
                 skin.useNearest(drawableScale, drawable) ? gl.NEAREST : gl.LINEAR);
 
-            twgl.setUniforms(currentShader, drawable.getUniforms());
+            this._setDrawableUniforms(currentShader, drawable.getUniforms());
 
             const skinSizeSetter = currentShader.uniformSetters.u_skinSize;
             if (skinSizeSetter) skinSizeSetter(skin.size);
@@ -2258,6 +2328,79 @@ class RenderWebGL extends EventEmitter {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
         this._textureFilterModes.set(texture, filter);
+    }
+
+    /**
+     * Bind a texture to texture unit 0, unless it is already bound there.
+     *
+     * Every clone of a sprite shares one skin and therefore one texture, and
+     * clones are usually drawn in consecutive passes over the draw list, so a
+     * scene with a few hundred clones of a dozen sprites issues a few hundred
+     * binds of a dozen distinct textures. Remembering the binding removes
+     * nearly all of them.
+     *
+     * Anything that binds a texture without going through here has to call
+     * _invalidateBoundTexture, or the remembered value becomes a lie.
+     * @param {WebGLTexture} texture The texture to bind.
+     */
+    _bindTexture (texture) {
+        if (this._boundTexture === texture) return;
+        const gl = this._gl;
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        this._boundTexture = texture;
+    }
+
+    /**
+     * Forget which texture is bound to texture unit 0.
+     */
+    _invalidateBoundTexture () {
+        this._boundTexture = null;
+    }
+
+    /**
+     * Upload a Drawable's uniforms to the currently bound program, skipping the
+     * ones whose value already matches.
+     *
+     * twgl.setUniforms uploads every uniform, every time. In a scene of a few
+     * hundred clones that is a few hundred uploads per frame of values that
+     * almost never differ: only u_modelMatrix actually changes between two
+     * clones of the same sprite, while the effect uniforms and
+     * u_silhouetteColor stay put for the life of the drawable, and most
+     * projects use no effects at all. A gl.uniform* call crosses into the GPU
+     * process; comparing a few numbers does not.
+     *
+     * Only valid while this program is the one bound and we are its only
+     * writer, which is why the cache is cleared on every program change.
+     * @param {twgl.ProgramInfo} shader The shader whose program is bound.
+     * @param {object} uniforms The Drawable's uniform values.
+     */
+    _setDrawableUniforms (shader, uniforms) {
+        const setters = shader.uniformSetters;
+        const cache = this._uniformValueCache;
+        for (const name in uniforms) {
+            if (!Object.prototype.hasOwnProperty.call(uniforms, name)) continue;
+            const setter = setters[name];
+            if (!setter) continue;
+            const value = uniforms[name];
+            const previous = cache.get(name);
+            // typeof rather than a comparison against undefined: the linter
+            // forbids the undefined literal, and a cache miss is still a miss.
+            const wasCached = typeof previous !== 'undefined';
+            if (wasCached && uniformValuesEqual(previous, value)) continue;
+            setter(value);
+            if (typeof value === 'number' || typeof value === 'boolean') {
+                cache.set(name, value);
+            } else if (wasCached &&
+                ArrayBuffer.isView(previous) &&
+                previous.length === value.length) {
+                // Reuse the snapshot buffer instead of allocating per frame. It
+                // has to be a copy, because Drawables update their matrices and
+                // effect values in place.
+                previous.set(value);
+            } else {
+                cache.set(name, value.slice());
+            }
+        }
     }
 
     /**

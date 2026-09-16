@@ -126,6 +126,13 @@ class Drawable {
         this._transformedHullPoints = null;
         this._transformedHullDirty = true;
 
+        // Most recently computed fast bounds, and whether they are still valid.
+        // getFastBounds rescans every transformed hull point on every call; a
+        // touching query calls it once per candidate, hundreds of times per
+        // frame with the same answer. See getCachedFastBounds.
+        this._fastBounds = new Rectangle();
+        this._fastBoundsDirty = true;
+
         this._skinWasAltered = this._skinWasAltered.bind(this);
 
         this.isTouching = this._isTouchingNever;
@@ -179,6 +186,7 @@ class Drawable {
 
         // Reset transform matrices
         this._transformDirty = true;
+        this._fastBoundsDirty = true;
         this._rotationMatrix = twgl.m4.identity();
         this._rotationTransformDirty = true;
         this._rotationAdjusted[0] = 0;
@@ -222,6 +230,7 @@ class Drawable {
         this._transformDirty = true;
         this._inverseTransformDirty = true;
         this._transformedHullDirty = true;
+        this._fastBoundsDirty = true;
     }
 
     /**
@@ -543,6 +552,7 @@ class Drawable {
      */
     setConvexHullDirty () {
         this._convexHullDirty = true;
+        this._fastBoundsDirty = true;
     }
 
     /**
@@ -552,6 +562,7 @@ class Drawable {
     setConvexHullPoints (points) {
         this._convexHullPoints = points;
         this._convexHullDirty = false;
+        this._fastBoundsDirty = true;
 
         // Re-create the "transformed hull points" array.
         // We only do this when the hull points change to avoid unnecessary allocations and GC.
@@ -673,6 +684,33 @@ class Drawable {
     }
 
     /**
+     * Bounds of this Drawable, computed at most once per change to its transform
+     * or convex hull.
+     *
+     * getFastBounds() rescans every transformed hull point on every call to find
+     * the minimum box around them, which is O(number of hull points) - tens to
+     * well over a hundred for a detailed costume. A touching query calls it once
+     * per candidate, so a scene where many clones ask about many others performs
+     * that scan hundreds of thousands of times per frame, almost always to get
+     * the same four numbers back. Measured on a 40 sprite by 40 sprite bench:
+     * 3.1 million hull point reads per 30 frames, against 39 thousand silhouette
+     * samples - the bounds scan, not the pixel test, was the cost of collision
+     * detection.
+     *
+     * The returned Rectangle belongs to this Drawable and must not be modified.
+     * Use getFastBounds(result) if you need one you can write to.
+     *
+     * @returns {Rectangle} Bounds for the Drawable. Read-only.
+     */
+    getCachedFastBounds () {
+        if (this._fastBoundsDirty) {
+            this.getFastBounds(this._fastBounds);
+            this._fastBoundsDirty = false;
+        }
+        return this._fastBounds;
+    }
+
+    /**
      * Transform all the convex hull points by the current Drawable's
      * transform. This allows us to skip recalculating the convex hull
      * for many Drawable updates, including translation, rotation, scaling.
@@ -725,6 +763,15 @@ class Drawable {
 
     /**
      * Update everything necessary to render this drawable on the CPU.
+     *
+     * Note: this deliberately does not skip work when it looks like nothing has
+     * changed. The silhouette it refreshes is shared by every drawable using the
+     * same skin, and a MIP created for one of them re-lazies it without telling
+     * the others - _touchingBounds alone calls getTexture([100, 100]), which can
+     * create that MIP. Skipping the refresh then leaves isTouching reading a
+     * silhouette whose pixels were never read in, which returns "not touching"
+     * for everything. Caching this was measured at roughly 1% of a
+     * 338-queries-per-frame budget, which is not worth the failure mode.
      */
     updateCPURenderAttributes () {
         this.updateMatrix();
