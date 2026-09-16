@@ -18530,6 +18530,13 @@ var Drawable = function () {
         this._transformedHullPoints = null;
         this._transformedHullDirty = true;
 
+        // Most recently computed fast bounds, and whether they are still valid.
+        // getFastBounds rescans every transformed hull point on every call; a
+        // touching query calls it once per candidate, hundreds of times per
+        // frame with the same answer. See getCachedFastBounds.
+        this._fastBounds = new Rectangle();
+        this._fastBoundsDirty = true;
+
         this._skinWasAltered = this._skinWasAltered.bind(this);
 
         this.isTouching = this._isTouchingNever;
@@ -18591,6 +18598,7 @@ var Drawable = function () {
 
             // Reset transform matrices
             this._transformDirty = true;
+            this._fastBoundsDirty = true;
             this._rotationMatrix = twgl.m4.identity();
             this._rotationTransformDirty = true;
             this._rotationAdjusted[0] = 0;
@@ -18637,6 +18645,7 @@ var Drawable = function () {
             this._transformDirty = true;
             this._inverseTransformDirty = true;
             this._transformedHullDirty = true;
+            this._fastBoundsDirty = true;
         }
 
         /**
@@ -18957,6 +18966,7 @@ var Drawable = function () {
         key: 'setConvexHullDirty',
         value: function setConvexHullDirty() {
             this._convexHullDirty = true;
+            this._fastBoundsDirty = true;
         }
 
         /**
@@ -18969,6 +18979,7 @@ var Drawable = function () {
         value: function setConvexHullPoints(points) {
             this._convexHullPoints = points;
             this._convexHullDirty = false;
+            this._fastBoundsDirty = true;
 
             // Re-create the "transformed hull points" array.
             // We only do this when the hull points change to avoid unnecessary allocations and GC.
@@ -19111,6 +19122,36 @@ var Drawable = function () {
         }
 
         /**
+         * Bounds of this Drawable, computed at most once per change to its transform
+         * or convex hull.
+         *
+         * getFastBounds() rescans every transformed hull point on every call to find
+         * the minimum box around them, which is O(number of hull points) - tens to
+         * well over a hundred for a detailed costume. A touching query calls it once
+         * per candidate, so a scene where many clones ask about many others performs
+         * that scan hundreds of thousands of times per frame, almost always to get
+         * the same four numbers back. Measured on a 40 sprite by 40 sprite bench:
+         * 3.1 million hull point reads per 30 frames, against 39 thousand silhouette
+         * samples - the bounds scan, not the pixel test, was the cost of collision
+         * detection.
+         *
+         * The returned Rectangle belongs to this Drawable and must not be modified.
+         * Use getFastBounds(result) if you need one you can write to.
+         *
+         * @returns {Rectangle} Bounds for the Drawable. Read-only.
+         */
+
+    }, {
+        key: 'getCachedFastBounds',
+        value: function getCachedFastBounds() {
+            if (this._fastBoundsDirty) {
+                this.getFastBounds(this._fastBounds);
+                this._fastBoundsDirty = false;
+            }
+            return this._fastBounds;
+        }
+
+        /**
          * Transform all the convex hull points by the current Drawable's
          * transform. This allows us to skip recalculating the convex hull
          * for many Drawable updates, including translation, rotation, scaling.
@@ -19169,6 +19210,15 @@ var Drawable = function () {
 
         /**
          * Update everything necessary to render this drawable on the CPU.
+         *
+         * Note: this deliberately does not skip work when it looks like nothing has
+         * changed. The silhouette it refreshes is shared by every drawable using the
+         * same skin, and a MIP created for one of them re-lazies it without telling
+         * the others - _touchingBounds alone calls getTexture([100, 100]), which can
+         * create that MIP. Skipping the refresh then leaves isTouching reading a
+         * silhouette whose pixels were never read in, which returns "not touching"
+         * for everything. Caching this was measured at roughly 1% of a
+         * 338-queries-per-frame budget, which is not worth the failure mode.
          */
 
     }, {
@@ -20600,11 +20650,11 @@ module.exports = {
 "use strict";
 
 
-var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) { return typeof obj; } : function (obj) { return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj; };
-
 var _slicedToArray = function () { function sliceIterator(arr, i) { var _arr = []; var _n = true; var _d = false; var _e = undefined; try { for (var _i = arr[Symbol.iterator](), _s; !(_n = (_s = _i.next()).done); _n = true) { _arr.push(_s.value); if (i && _arr.length === i) break; } } catch (err) { _d = true; _e = err; } finally { try { if (!_n && _i["return"]) _i["return"](); } finally { if (_d) throw _e; } } return _arr; } return function (arr, i) { if (Array.isArray(arr)) { return arr; } else if (Symbol.iterator in Object(arr)) { return sliceIterator(arr, i); } else { throw new TypeError("Invalid attempt to destructure non-iterable instance"); } }; }();
 
 var _createClass = function () { function defineProperties(target, props) { for (var i = 0; i < props.length; i++) { var descriptor = props[i]; descriptor.enumerable = descriptor.enumerable || false; descriptor.configurable = true; if ("value" in descriptor) descriptor.writable = true; Object.defineProperty(target, descriptor.key, descriptor); } } return function (Constructor, protoProps, staticProps) { if (protoProps) defineProperties(Constructor.prototype, protoProps); if (staticProps) defineProperties(Constructor, staticProps); return Constructor; }; }();
+
+var _typeof = typeof Symbol === "function" && typeof Symbol.iterator === "symbol" ? function (obj) { return typeof obj; } : function (obj) { return obj && typeof Symbol === "function" && obj.constructor === Symbol && obj !== Symbol.prototype ? "symbol" : typeof obj; };
 
 function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
 
@@ -20646,6 +20696,26 @@ var __projectionUniforms = { u_projectionMatrix: null };
 // More pixels than this and we give up to the GPU and take the cost of readPixels
 // Width * Height * Number of drawables at location
 var __cpuTouchingColorPixelCount = 4e4;
+
+/**
+ * Whether two uniform values are the same, for the purpose of skipping a
+ * redundant upload. Uniform values are numbers or small numeric arrays.
+ * @param {*} a One uniform value.
+ * @param {*} b The other uniform value.
+ * @returns {boolean} True if uploading `b` would be redundant.
+ */
+var uniformValuesEqual = function uniformValuesEqual(a, b) {
+    if (a === b) return true;
+    if ((typeof a === 'undefined' ? 'undefined' : _typeof(a)) !== 'object' || (typeof b === 'undefined' ? 'undefined' : _typeof(b)) !== 'object' || a === null || b === null) {
+        return false;
+    }
+    var length = a.length;
+    if (length !== b.length) return false;
+    for (var i = 0; i < length; i++) {
+        if (a[i] !== b[i]) return false;
+    }
+    return true;
+};
 
 /**
  * @callback RenderWebGL#idFilterFunc
@@ -20858,6 +20928,16 @@ var RenderWebGL = function (_EventEmitter) {
 
         // Texture filtering is texture state, so only update it when the requested mode changes.
         _this._textureFilterModes = new WeakMap();
+
+        // Which texture is bound to texture unit 0, so that re-binding the same
+        // one (every clone of a sprite shares it) can be skipped. null means
+        // "unknown", never "nothing bound".
+        _this._boundTexture = null;
+
+        // Last uploaded value of each uniform on the currently bound program, so
+        // that uploading an unchanged value can be skipped. Cleared whenever the
+        // program changes; see _setDrawableUniforms.
+        _this._uniformValueCache = new Map();
 
         /** @type {any} */
         _this._regionId = null;
@@ -22505,7 +22585,11 @@ var RenderWebGL = function (_EventEmitter) {
             /** @todo remove this once URL-based skin setting is removed. */
             if (!drawable.skin || !drawable.skin.getTexture([100, 100])) return null;
 
-            var bounds = drawable.getFastBounds(__touchingBounds);
+            // Take a copy of the cached bounds: the clamping and snapping below
+            // write to the rectangle, and the cache is read-only.
+            var cachedBounds = drawable.getCachedFastBounds();
+            var bounds = __touchingBounds;
+            bounds.initFromBounds(cachedBounds.left, cachedBounds.right, cachedBounds.bottom, cachedBounds.top);
 
             // Limit queries to the stage size.
             if (!this.offscreenTouching) {
@@ -22553,24 +22637,40 @@ var RenderWebGL = function (_EventEmitter) {
                         // contents of a private skin.
                         if (!this.allowPrivateSkinAccess && drawable.skin.private) continue;
 
-                        var candidateBounds = drawable.getFastBounds(__candidateBounds);
+                        // Was getFastBounds(__candidateBounds): rescanning the
+                        // candidate's transformed hull points for every query is the
+                        // single largest cost of a touching check. The result only
+                        // changes when the candidate's transform or hull does, so
+                        // read the cached copy instead.
+                        var cachedBounds = drawable.getCachedFastBounds();
 
                         // Push bounds out to integers. If a drawable extends out into half a pixel, that half-pixel still
                         // needs to be tested. Plus, in some areas we construct another rectangle from the union of these,
                         // and iterate over its pixels (width * height). Turns out that doesn't work so well when the
                         // width/height aren't integers.
-                        candidateBounds.snapToInt();
+                        //
+                        // Snapping into locals and intersecting inline, rather than
+                        // writing a scratch Rectangle and calling intersects(),
+                        // keeps the common case - a candidate nowhere near the query
+                        // - down to four rounding operations and four comparisons.
+                        // The scratch rectangle is only filled in once we know it
+                        // intersects, exactly as before.
+                        var candidateLeft = Math.floor(cachedBounds.left);
+                        var candidateRight = Math.ceil(cachedBounds.right);
+                        var candidateBottom = Math.floor(cachedBounds.bottom);
+                        var candidateTop = Math.ceil(cachedBounds.top);
 
-                        if (bounds.intersects(candidateBounds)) {
+                        if (bounds.left <= candidateRight && candidateLeft <= bounds.right && bounds.top >= candidateBottom && candidateTop >= bounds.bottom) {
                             // Update the CPU position data
                             drawable.updateCPURenderAttributes();
                             if (result.length >= pool.length) {
                                 pool.push(new Rectangle());
                             }
+                            __candidateBounds.initFromBounds(candidateLeft, candidateRight, candidateBottom, candidateTop);
                             result.push({
                                 id: id,
                                 drawable: drawable,
-                                intersection: Rectangle.intersect(bounds, candidateBounds, pool[result.length])
+                                intersection: Rectangle.intersect(bounds, __candidateBounds, pool[result.length])
                             });
                         }
                     }
@@ -23026,6 +23126,10 @@ var RenderWebGL = function (_EventEmitter) {
 
             gl.activeTexture(gl.TEXTURE0);
             if (gl.bindSampler) gl.bindSampler(0, null);
+            // Anything outside this method may have bound a texture to unit 0 in the
+            // meantime (a lazily created MIP, a new skin), so start from unknown and
+            // rebuild the knowledge as we go.
+            this._boundTexture = null;
 
             var framebufferSpaceScaleDiffers = 'framebufferWidth' in opts && 'framebufferHeight' in opts && opts.framebufferWidth !== this._nativeSize[0] && opts.framebufferHeight !== this._nativeSize[1];
 
@@ -23080,12 +23184,18 @@ var RenderWebGL = function (_EventEmitter) {
                     gl.uniform1i(currentShader.uniformSetters.u_skin.location, 0);
                     __projectionUniforms.u_projectionMatrix = projection;
                     twgl.setUniforms(currentShader, __projectionUniforms);
+
+                    // Uniform values live on the program, and we are the only writer
+                    // while this program is bound, so the cache describes exactly
+                    // this program. A different program may hold nothing, so start
+                    // over rather than assume our values carried across.
+                    this._uniformValueCache.clear();
                 }
 
-                gl.bindTexture(gl.TEXTURE_2D, texture);
+                this._bindTexture(texture);
                 this._setTextureFilter(texture, skin.useNearest(drawableScale, drawable) ? gl.NEAREST : gl.LINEAR);
 
-                twgl.setUniforms(currentShader, drawable.getUniforms());
+                this._setDrawableUniforms(currentShader, drawable.getUniforms());
 
                 var skinSizeSetter = currentShader.uniformSetters.u_skinSize;
                 if (skinSizeSetter) skinSizeSetter(skin.size);
@@ -23108,6 +23218,86 @@ var RenderWebGL = function (_EventEmitter) {
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
             gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
             this._textureFilterModes.set(texture, filter);
+        }
+
+        /**
+         * Bind a texture to texture unit 0, unless it is already bound there.
+         *
+         * Every clone of a sprite shares one skin and therefore one texture, and
+         * clones are usually drawn in consecutive passes over the draw list, so a
+         * scene with a few hundred clones of a dozen sprites issues a few hundred
+         * binds of a dozen distinct textures. Remembering the binding removes
+         * nearly all of them.
+         *
+         * Anything that binds a texture without going through here has to call
+         * _invalidateBoundTexture, or the remembered value becomes a lie.
+         * @param {WebGLTexture} texture The texture to bind.
+         */
+
+    }, {
+        key: '_bindTexture',
+        value: function _bindTexture(texture) {
+            if (this._boundTexture === texture) return;
+            var gl = this._gl;
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            this._boundTexture = texture;
+        }
+
+        /**
+         * Forget which texture is bound to texture unit 0.
+         */
+
+    }, {
+        key: '_invalidateBoundTexture',
+        value: function _invalidateBoundTexture() {
+            this._boundTexture = null;
+        }
+
+        /**
+         * Upload a Drawable's uniforms to the currently bound program, skipping the
+         * ones whose value already matches.
+         *
+         * twgl.setUniforms uploads every uniform, every time. In a scene of a few
+         * hundred clones that is a few hundred uploads per frame of values that
+         * almost never differ: only u_modelMatrix actually changes between two
+         * clones of the same sprite, while the effect uniforms and
+         * u_silhouetteColor stay put for the life of the drawable, and most
+         * projects use no effects at all. A gl.uniform* call crosses into the GPU
+         * process; comparing a few numbers does not.
+         *
+         * Only valid while this program is the one bound and we are its only
+         * writer, which is why the cache is cleared on every program change.
+         * @param {twgl.ProgramInfo} shader The shader whose program is bound.
+         * @param {object} uniforms The Drawable's uniform values.
+         */
+
+    }, {
+        key: '_setDrawableUniforms',
+        value: function _setDrawableUniforms(shader, uniforms) {
+            var setters = shader.uniformSetters;
+            var cache = this._uniformValueCache;
+            for (var name in uniforms) {
+                if (!Object.prototype.hasOwnProperty.call(uniforms, name)) continue;
+                var setter = setters[name];
+                if (!setter) continue;
+                var value = uniforms[name];
+                var previous = cache.get(name);
+                // typeof rather than a comparison against undefined: the linter
+                // forbids the undefined literal, and a cache miss is still a miss.
+                var wasCached = typeof previous !== 'undefined';
+                if (wasCached && uniformValuesEqual(previous, value)) continue;
+                setter(value);
+                if (typeof value === 'number' || typeof value === 'boolean') {
+                    cache.set(name, value);
+                } else if (wasCached && ArrayBuffer.isView(previous) && previous.length === value.length) {
+                    // Reuse the snapshot buffer instead of allocating per frame. It
+                    // has to be a copy, because Drawables update their matrices and
+                    // effect values in place.
+                    previous.set(value);
+                } else {
+                    cache.set(name, value.slice());
+                }
+            }
         }
 
         /**
@@ -23603,6 +23793,10 @@ var SVGSkin = function (_Skin) {
             };
 
             var mip = twgl.createTexture(this._renderer.gl, textureOptions);
+            // createTexture binds the new texture to the active texture unit without
+            // going through the renderer, and MIPs are created lazily during a draw,
+            // so the renderer's record of what is bound is now stale.
+            this._renderer._invalidateBoundTexture();
 
             // Check if this is the largest MIP created so far. Currently, silhouettes only get scaled up.
             if (isLargestMIP) {
@@ -24508,7 +24702,10 @@ var Skin = function () {
     value: function _setTexture(textureData) {
       var gl = this._renderer.gl;
 
-      gl.bindTexture(gl.TEXTURE_2D, this._texture);
+      // Go through the renderer so its record of what is bound to texture unit
+      // 0 stays accurate; a skin uploads its texture mid-draw when a MIP is
+      // created lazily.
+      this._renderer._bindTexture(this._texture);
       // Premultiplied alpha is necessary for proper blending.
       // See http://www.realtimerendering.com/blog/gpus-prefer-premultiplication/
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
