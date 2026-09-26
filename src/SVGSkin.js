@@ -12,6 +12,25 @@ const ShaderManager = require('./ShaderManager');
  */
 const INDEX_OFFSET = 8;
 
+/**
+ * Whether the expensive half of setSVG -- serializing the SVG with its fonts
+ * inlined, and starting the bitmap load -- is deferred until this skin's texture
+ * is first requested.
+ *
+ * Loading a project creates a skin for every costume it has, but only the
+ * costumes that are actually drawn are ever asked for a texture, and the
+ * serialization is by far the most expensive part of setSVG: the fonts an SVG
+ * uses are embedded into it as base64, so a text costume of a few hundred bytes
+ * turns into a string of a few hundred kilobytes. Measured on one real project
+ * (437 costume skins over 347 unique SVGs, a single sprite holding 215 of them),
+ * only 21 skins were on screen once loading finished, so almost all of that work
+ * was being paid for costumes nobody had asked to see yet.
+ *
+ * Set to false to restore the previous eager behaviour.
+ * @const {boolean}
+ */
+const DEFER_SVG_MATERIALIZATION = true;
+
 class SVGSkin extends Skin {
     /**
      * Create a new SVG skin.
@@ -49,12 +68,30 @@ class SVGSkin extends Skin {
         * @type {Number}
         */
         this._maxTextureScale = 1;
+
+        /**
+         * The parsed SVG and the metrics taken from it, waiting to be turned into
+         * an image by _materializeSVG(). The `svgTag` is released as soon as it has
+         * been serialized, so this holds onto very little for skins that are never
+         * drawn.
+         * @type {?object}
+         */
+        this._pendingSVG = null;
+
+        /**
+         * Whether _materializeSVG() has already started work for the current
+         * _pendingSVG, so that a second call does not start a second load.
+         * @type {boolean}
+         */
+        this._pendingSVGStarted = false;
     }
 
     /**
      * Dispose of this object. Do not use it after calling this method.
      */
     dispose () {
+        // Drop any deferred work; this skin is not going to be drawn again.
+        this._pendingSVG = null;
         this.resetMIPs();
         super.dispose();
     }
@@ -165,6 +202,12 @@ class SVGSkin extends Skin {
      * @return {WebGLTexture} The GL texture representation of this skin when drawing at the given scale.
      */
     getTexture (scale) {
+        // A skin gets created for every costume a project has, but this is the
+        // first point at which we know a costume is actually going to be drawn,
+        // so this is where the expensive part of setSVG() is paid for. Costumes
+        // that are never drawn never pay for it at all.
+        this._materializeSVG();
+
         // The texture only ever gets uniform scale. Take the larger of the two axes.
         const scaleMax = scale ? Math.max(Math.abs(scale[0]), Math.abs(scale[1])) : 100;
         const requestedScale = Math.min(scaleMax / 100, this._maxTextureScale);
@@ -202,7 +245,6 @@ class SVGSkin extends Skin {
      */
     setSVG (svgData, rotationCenter) {
         const svgTag = loadSvgString(svgData);
-        const svgText = serializeSvgToString(svgTag, this._renderer.customFonts);
         this._svgImageLoaded = false;
 
         const {x, y, width, height} = svgTag.viewBox.baseVal;
@@ -211,8 +253,41 @@ class SVGSkin extends Skin {
         // drawables using this skin to update, until the image is loaded.
         // We need to do this because the VM reads the skin's `size` directly after calling `setSVG`.
         // TODO: return a Promise so that the VM can read the skin's `size` after the image is loaded.
+        //
+        // The size comes from the parsed SVG's viewBox, so it is available without
+        // materializing the image; that is what makes the deferral below possible.
         this._size[0] = width;
         this._size[1] = height;
+
+        // Discard the handler of any load already in progress, which cancels the
+        // effect of that load -- the same thing the reassignment below used to do.
+        this._svgImage.onload = null;
+        this._pendingSVG = {svgTag, x, y, width, height, rotationCenter};
+        this._pendingSVGStarted = false;
+
+        // Serializing the SVG (fonts included) and starting the image load is the
+        // expensive half of setSVG. Skins are created for every costume of a
+        // project but only drawn costumes need a texture, so by default it is left
+        // to _materializeSVG() to do that on first use.
+        if (!DEFER_SVG_MATERIALIZATION) this._materializeSVG();
+    }
+
+    /**
+     * Turn this skin's pending parsed SVG into a loaded image, and take the metrics
+     * that the image load is responsible for. Safe to call more than once: only the
+     * first call for a given setSVG() does any work.
+     */
+    _materializeSVG () {
+        if (this._pendingSVGStarted || !this._pendingSVG) {
+            return;
+        }
+        this._pendingSVGStarted = true;
+
+        const {svgTag, x, y, width, height, rotationCenter} = this._pendingSVG;
+        const svgText = serializeSvgToString(svgTag, this._renderer.customFonts);
+        // Nothing below needs the DOM tree any more, and holding one per costume
+        // would be the main cost of deferring: release it now.
+        this._pendingSVG.svgTag = null;
 
         // If there is another load already in progress, replace the old onload to effectively cancel the old load
         this._svgImage.onload = () => {
@@ -230,11 +305,15 @@ class SVGSkin extends Skin {
 
             this.resetMIPs();
 
-            if (typeof rotationCenter === 'undefined') rotationCenter = this.calculateRotationCenter();
+            // `rotationCenter` may have been supplied by the caller (the VM normally
+            // does, straight from the project's stored value); otherwise fall back to
+            // the centre of the viewBox, which only needs the size, not the image.
+            const center = typeof rotationCenter === 'undefined' ?
+                this.calculateRotationCenter() : rotationCenter;
             // Compensate for viewbox offset.
             // See https://github.com/LLK/scratch-render/pull/90.
-            this._rotationCenter[0] = rotationCenter[0] - x;
-            this._rotationCenter[1] = rotationCenter[1] - y;
+            this._rotationCenter[0] = center[0] - x;
+            this._rotationCenter[1] = center[1] - y;
 
             this._svgImageLoaded = true;
 
