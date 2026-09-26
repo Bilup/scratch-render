@@ -37,7 +37,30 @@ class ShaderManager {
         }
         let shader = cache[effectBits];
         if (!shader) {
-            shader = cache[effectBits] = this._buildShader(drawMode, effectBits);
+            try {
+                shader = cache[effectBits] = this._buildShader(drawMode, effectBits);
+            } catch (e) {
+                // If building a shader with effects fails, fall back to the base shader
+                // (no effects). This can happen when the WebGL context is lost or the
+                // GPU/driver doesn't support the shader variant.
+                console.warn(
+                    `Shader compilation failed for mode ${drawMode}, effects ${effectBits}. ` +
+                    'Falling back to base shader (effects will not be rendered).',
+                    e
+                );
+                shader = cache[0];
+                if (!shader) {
+                    try {
+                        shader = cache[0] = this._buildShader(drawMode, 0);
+                    } catch (e2) {
+                        // If the base shader also fails, the WebGL context is likely lost.
+                        // Re-throw the original error.
+                        throw e;
+                    }
+                }
+                // Cache the fallback so we don't retry the failing shader every frame
+                cache[effectBits] = shader;
+            }
         }
         return shader;
     }
