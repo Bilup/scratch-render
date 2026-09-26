@@ -6044,6 +6044,25 @@ var ShaderManager = __webpack_require__(/*! ./ShaderManager */ "./src/ShaderMana
  */
 var INDEX_OFFSET = 8;
 
+/**
+ * Whether the expensive half of setSVG -- serializing the SVG with its fonts
+ * inlined, and starting the bitmap load -- is deferred until this skin's texture
+ * is first requested.
+ *
+ * Loading a project creates a skin for every costume it has, but only the
+ * costumes that are actually drawn are ever asked for a texture, and the
+ * serialization is by far the most expensive part of setSVG: the fonts an SVG
+ * uses are embedded into it as base64, so a text costume of a few hundred bytes
+ * turns into a string of a few hundred kilobytes. Measured on one real project
+ * (437 costume skins over 347 unique SVGs, a single sprite holding 215 of them),
+ * only 21 skins were on screen once loading finished, so almost all of that work
+ * was being paid for costumes nobody had asked to see yet.
+ *
+ * Set to false to restore the previous eager behaviour.
+ * @const {boolean}
+ */
+var DEFER_SVG_MATERIALIZATION = true;
+
 var SVGSkin = function (_Skin) {
     _inherits(SVGSkin, _Skin);
 
@@ -6085,6 +6104,22 @@ var SVGSkin = function (_Skin) {
         * @type {Number}
         */
         _this._maxTextureScale = 1;
+
+        /**
+         * The parsed SVG and the metrics taken from it, waiting to be turned into
+         * an image by _materializeSVG(). The `svgTag` is released as soon as it has
+         * been serialized, so this holds onto very little for skins that are never
+         * drawn.
+         * @type {?object}
+         */
+        _this._pendingSVG = null;
+
+        /**
+         * Whether _materializeSVG() has already started work for the current
+         * _pendingSVG, so that a second call does not start a second load.
+         * @type {boolean}
+         */
+        _this._pendingSVGStarted = false;
         return _this;
     }
 
@@ -6096,6 +6131,8 @@ var SVGSkin = function (_Skin) {
     _createClass(SVGSkin, [{
         key: 'dispose',
         value: function dispose() {
+            // Drop any deferred work; this skin is not going to be drawn again.
+            this._pendingSVG = null;
             this.resetMIPs();
             _get(SVGSkin.prototype.__proto__ || Object.getPrototypeOf(SVGSkin.prototype), 'dispose', this).call(this);
         }
@@ -6207,6 +6244,12 @@ var SVGSkin = function (_Skin) {
     }, {
         key: 'getTexture',
         value: function getTexture(scale) {
+            // A skin gets created for every costume a project has, but this is the
+            // first point at which we know a costume is actually going to be drawn,
+            // so this is where the expensive part of setSVG() is paid for. Costumes
+            // that are never drawn never pay for it at all.
+            this._materializeSVG();
+
             // The texture only ever gets uniform scale. Take the larger of the two axes.
             var scaleMax = scale ? Math.max(Math.abs(scale[0]), Math.abs(scale[1])) : 100;
             var requestedScale = Math.min(scaleMax / 100, this._maxTextureScale);
@@ -6253,10 +6296,7 @@ var SVGSkin = function (_Skin) {
     }, {
         key: 'setSVG',
         value: function setSVG(svgData, rotationCenter) {
-            var _this3 = this;
-
             var svgTag = loadSvgString(svgData);
-            var svgText = serializeSvgToString(svgTag, this._renderer.customFonts);
             this._svgImageLoaded = false;
 
             var _svgTag$viewBox$baseV = svgTag.viewBox.baseVal,
@@ -6269,9 +6309,54 @@ var SVGSkin = function (_Skin) {
             // drawables using this skin to update, until the image is loaded.
             // We need to do this because the VM reads the skin's `size` directly after calling `setSVG`.
             // TODO: return a Promise so that the VM can read the skin's `size` after the image is loaded.
+            //
+            // The size comes from the parsed SVG's viewBox, so it is available without
+            // materializing the image; that is what makes the deferral below possible.
 
             this._size[0] = width;
             this._size[1] = height;
+
+            // Discard the handler of any load already in progress, which cancels the
+            // effect of that load -- the same thing the reassignment below used to do.
+            this._svgImage.onload = null;
+            this._pendingSVG = { svgTag: svgTag, x: x, y: y, width: width, height: height, rotationCenter: rotationCenter };
+            this._pendingSVGStarted = false;
+
+            // Serializing the SVG (fonts included) and starting the image load is the
+            // expensive half of setSVG. Skins are created for every costume of a
+            // project but only drawn costumes need a texture, so by default it is left
+            // to _materializeSVG() to do that on first use.
+            if (!DEFER_SVG_MATERIALIZATION) this._materializeSVG();
+        }
+
+        /**
+         * Turn this skin's pending parsed SVG into a loaded image, and take the metrics
+         * that the image load is responsible for. Safe to call more than once: only the
+         * first call for a given setSVG() does any work.
+         */
+
+    }, {
+        key: '_materializeSVG',
+        value: function _materializeSVG() {
+            var _this3 = this;
+
+            if (this._pendingSVGStarted || !this._pendingSVG) {
+                return;
+            }
+            this._pendingSVGStarted = true;
+
+            var _pendingSVG = this._pendingSVG,
+                svgTag = _pendingSVG.svgTag,
+                x = _pendingSVG.x,
+                y = _pendingSVG.y,
+                width = _pendingSVG.width,
+                height = _pendingSVG.height,
+                rotationCenter = _pendingSVG.rotationCenter;
+
+            var svgText = serializeSvgToString(svgTag, this._renderer.customFonts);
+            // Nothing below needs the DOM tree any more, and holding one per costume
+            // would be the main cost of deferring: release it now.
+            this._pendingSVG.svgTag = null;
 
             // If there is another load already in progress, replace the old onload to effectively cancel the old load
             this._svgImage.onload = function () {
@@ -6289,11 +6374,14 @@ var SVGSkin = function (_Skin) {
 
                 _this3.resetMIPs();
 
-                if (typeof rotationCenter === 'undefined') rotationCenter = _this3.calculateRotationCenter();
+                // `rotationCenter` may have been supplied by the caller (the VM normally
+                // does, straight from the project's stored value); otherwise fall back to
+                // the centre of the viewBox, which only needs the size, not the image.
+                var center = typeof rotationCenter === 'undefined' ? _this3.calculateRotationCenter() : rotationCenter;
                 // Compensate for viewbox offset.
                 // See https://github.com/LLK/scratch-render/pull/90.
-                _this3._rotationCenter[0] = rotationCenter[0] - x;
-                _this3._rotationCenter[1] = rotationCenter[1] - y;
+                _this3._rotationCenter[0] = center[0] - x;
+                _this3._rotationCenter[1] = center[1] - y;
 
                 _this3._svgImageLoaded = true;
 
@@ -6374,7 +6462,26 @@ var ShaderManager = function () {
             }
             var shader = cache[effectBits];
             if (!shader) {
-                shader = cache[effectBits] = this._buildShader(drawMode, effectBits);
+                try {
+                    shader = cache[effectBits] = this._buildShader(drawMode, effectBits);
+                } catch (e) {
+                    // If building a shader with effects fails, fall back to the base shader
+                    // (no effects). This can happen when the WebGL context is lost or the
+                    // GPU/driver doesn't support the shader variant.
+                    console.warn('Shader compilation failed for mode ' + drawMode + ', effects ' + effectBits + '. ' + 'Falling back to base shader (effects will not be rendered).', e);
+                    shader = cache[0];
+                    if (!shader) {
+                        try {
+                            shader = cache[0] = this._buildShader(drawMode, 0);
+                        } catch (e2) {
+                            // If the base shader also fails, the WebGL context is likely lost.
+                            // Re-throw the original error.
+                            throw e;
+                        }
+                    }
+                    // Cache the fallback so we don't retry the failing shader every frame
+                    cache[effectBits] = shader;
+                }
             }
             return shader;
         }
