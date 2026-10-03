@@ -3,6 +3,24 @@ const twgl = require('twgl.js');
 const RenderConstants = require('./RenderConstants');
 const Silhouette = require('./Silhouette');
 
+/**
+ * Longest edge, in texels, of the bitmap a silhouette is sampled from.
+ *
+ * A silhouette is a second width * height * 4 byte pixel buffer that lives
+ * beside the texture, and it exists only to answer "is there ink near this
+ * point". Silhouette samples it through normalised [0, 1] coordinates, so a
+ * smaller buffer is exactly as correct -- just coarser -- and 256 texels across
+ * a whole costume is already far finer than any touching? answer needs.
+ *
+ * Capping it matters for two reasons. The buffer itself is otherwise as large
+ * as the texture; and because the silhouette only materialises lazily, every
+ * costume that is not the one currently drawn used to pin the decoded bitmap it
+ * was built from for the whole session, which on a large project is a second
+ * full copy of every costume's pixels.
+ * @const {number}
+ */
+const MAX_SILHOUETTE_DIMENSION = 256;
+
 class Skin {
     /**
      * Create a Skin, which stores and/or generates textures for use in rendering.
@@ -66,6 +84,12 @@ class Skin {
      */
     dispose () {
         this._id = RenderConstants.ID_NONE;
+        // The silhouette holds a width * height * 4 byte pixel buffer, i.e. as
+        // much memory as the texture itself, and it is otherwise kept for the
+        // lifetime of the skin. Nothing may observe this skin after dispose(),
+        // so hand it back now instead of waiting for the whole skin object to
+        // become unreachable.
+        this._silhouette.dispose();
     }
 
     /**
@@ -182,7 +206,51 @@ class Skin {
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, textureData);
         gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
 
-        this._silhouette.update(textureData);
+        this._silhouette.update(Skin._silhouetteSource(textureData));
+    }
+
+    /**
+     * Build the bitmap the silhouette is sampled from, at most
+     * MAX_SILHOUETTE_DIMENSION texels on its longest edge.
+     *
+     * Returns the input untouched when it is already small enough. Otherwise a
+     * reduced copy is returned, which is what keeps the lazily-retained
+     * silhouette source down to kilobytes: Silhouette stores whatever it is
+     * handed and only reads it on first use, so handing it the full-resolution
+     * costume would pin the decoded bitmap of every costume in the project.
+     *
+     * @param {ImageData|HTMLImageElement|HTMLCanvasElement|HTMLVideoElement} textureData - uploaded texture source
+     * @returns {ImageData|HTMLCanvasElement} the bitmap to sample the silhouette from
+     * @private
+     */
+    static _silhouetteSource (textureData) {
+        const width = textureData.width;
+        const height = textureData.height;
+        const longestEdge = Math.max(width, height);
+        if (!(longestEdge > MAX_SILHOUETTE_DIMENSION)) {
+            return textureData;
+        }
+
+        const ratio = MAX_SILHOUETTE_DIMENSION / longestEdge;
+        const targetWidth = Math.max(1, Math.round(width * ratio));
+        const targetHeight = Math.max(1, Math.round(height * ratio));
+
+        const canvas = document.createElement('canvas');
+        canvas.width = targetWidth;
+        canvas.height = targetHeight;
+        const context = canvas.getContext('2d');
+        if (textureData instanceof ImageData) {
+            // drawImage rejects ImageData, so stage it 1:1 first. Rare: only the
+            // VM's reused canvases reach here as ImageData.
+            const staging = document.createElement('canvas');
+            staging.width = width;
+            staging.height = height;
+            staging.getContext('2d').putImageData(textureData, 0, 0);
+            context.drawImage(staging, 0, 0, targetWidth, targetHeight);
+        } else {
+            context.drawImage(textureData, 0, 0, targetWidth, targetHeight);
+        }
+        return canvas;
     }
 
     /**

@@ -742,8 +742,42 @@ class RenderWebGL extends EventEmitter {
      */
     destroySkin (skinId) {
         const oldSkin = this._allSkins[skinId];
+        // Tolerate a second call for a skin that is already gone. Scratch3Looks
+        // destroys a speech bubble's drawable and then its skin, and destroying
+        // the drawable already releases an orphaned skin (see destroyDrawable),
+        // so that second call must be a no-op rather than a TypeError.
+        if (!oldSkin) {
+            return;
+        }
         oldSkin.dispose();
         delete this._allSkins[skinId];
+    }
+
+    /**
+     * Destroy every skin that no drawable is currently attached to.
+     *
+     * A sprite owns a skin per costume but only ever has one drawable, so the
+     * costumes that are not currently selected -- normally most of a project's
+     * textures -- are unattached by construction and can never be reached by
+     * destroyDrawable(). Scratch-vm calls this from Runtime.dispose(), i.e. at
+     * the start of every project load, where the outgoing project's targets are
+     * all gone and its remaining skins are pure dead weight.
+     *
+     * Everything that has to outlive a project is still attached to a drawable
+     * nobody destroys, so the refcount alone keeps it: the pen layer and its
+     * stamp source (scratch3_pen) and the video preview layer (io/video). The
+     * pen skin is skipped by id as well, because the pen extension caches its
+     * id across projects and would otherwise be left holding a dead one.
+     */
+    releaseUnattachedSkins () {
+        for (const skinId of Object.keys(this._allSkins)) {
+            const skin = this._allSkins[skinId];
+            if (!skin) continue;
+            if (skin.attachedDrawables.size !== 0) continue;
+            if (Number(skinId) === this._penSkinId) continue;
+            skin.dispose();
+            delete this._allSkins[skinId];
+        }
     }
 
     /**
@@ -873,7 +907,29 @@ class RenderWebGL extends EventEmitter {
         }
         this.dirty = true;
         const drawable = this._allDrawables[drawableID];
+        // Grab the skin before disposing: the setter run by dispose() clears
+        // drawable.skin and unregisters this drawable from the skin.
+        const ownedSkin = drawable.skin;
         drawable.dispose();
+
+        // Release a skin that no drawable references any more.
+        //
+        // Without this, nothing ever destroys a costume's skin: every project
+        // load runs Runtime.dispose() -> RenderedTarget.dispose() ->
+        // destroyDrawable(), but the skin stayed in _allSkins (along with its GL
+        // texture and its equally large silhouette buffer) for the lifetime of
+        // the renderer. Loading project B after project A therefore cost A + B,
+        // and a third load cost A + B + C -- which is what makes opening a large
+        // project on Android drive the WebView renderer into an OOM crash.
+        //
+        // Costume switching does not come through here, so a skin that is merely
+        // not the selected costume keeps its texture. Clones share their
+        // original's skin, so the refcount only reaches zero when the last
+        // drawable using it is gone. The pen layer is excluded because the pen
+        // extension caches its skin id and expects it to outlive targets.
+        if (ownedSkin && ownedSkin.attachedDrawables.size === 0 && ownedSkin.id !== this._penSkinId) {
+            this.destroySkin(ownedSkin.id);
+        }
 
         const currentLayerGroup = this._layerGroups[group];
         const endIndex = this._endIndexForKnownLayerGroup(currentLayerGroup);

@@ -164,6 +164,23 @@ class Silhouette {
         delete this.colorAtLinear;
     }
 
+    /**
+     * Drop the pixel data this silhouette holds.
+     *
+     * The buffer is width * height * 4 bytes -- exactly the same order of
+     * magnitude as the skin's GL texture -- and it is retained for the whole
+     * life of the skin, so releasing it matters as much as releasing the
+     * texture. Called from Skin.dispose(); the silhouette reports "touching
+     * nothing" afterwards, which is correct because a disposed skin must never
+     * be used again.
+     */
+    dispose () {
+        this._colorData = null;
+        this._lazyData = null;
+        this._width = 0;
+        this._height = 0;
+    }
+
     unlazy () {
         if (!this._lazyData) {
             return;
