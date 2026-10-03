@@ -184,7 +184,11 @@ class SVGSkin extends Skin {
 
         // Check if this is the largest MIP created so far. Currently, silhouettes only get scaled up.
         if (isLargestMIP) {
-            this._silhouette.update(textureData);
+            // Sample the silhouette from a reduced copy, for the same reason
+            // bitmap costumes do: the buffer is a second width * height * 4 bytes
+            // and 256 texels across is already finer than any touching? answer
+            // needs. See MAX_SILHOUETTE_DIMENSION in Skin.js.
+            this._silhouette.update(Skin._silhouetteSource(textureData));
             this._largestMIPScale = scale;
         }
 
