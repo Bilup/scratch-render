@@ -105,6 +105,17 @@ class Drawable {
         this._rotationTransformDirty = true;
         this._rotationAdjusted = twgl.v3.create();
         this._rotationCenterDirty = true;
+        /**
+         * The Skin this Drawable is drawn with, or null when it has none.
+         * Assigned explicitly so the field is never undefined: the renderer's
+         * fence calculation reads it directly (see
+         * RenderWebGL.getFencedPositionOfDrawable), and undefined there is the
+         * difference between "no skin, nothing to clamp against" and a
+         * TypeError thrown out of Runtime._step.
+         * @type {?Skin}
+         * @private
+         */
+        this._skin = null;
         this._skinScale = twgl.v3.create(0, 0, 0);
         this._skinScaleDirty = true;
         this._inverseMatrix = twgl.m4.identity();
@@ -251,13 +262,20 @@ class Drawable {
      * @param {Skin} newSkin - A new Skin for this Drawable.
      */
     set skin (newSkin) {
-        if (this._skin !== newSkin) {
+        // Normalise undefined to null. This field is read directly (not through
+        // the getter) by getFencedPositionOfDrawable, which only checks that the
+        // drawable exists -- so an undefined here is the difference between
+        // "no skin, nothing to fence against" and a TypeError thrown out of
+        // Runtime._step that stops the whole project. Every other consumer
+        // already treats a missing skin as falsy.
+        const skin = newSkin === undefined ? null : newSkin;
+        if (this._skin !== skin) {
             if (this._skin) {
                 this._skin.attachedDrawables.delete(this);
             }
-            this._skin = newSkin;
-            if (newSkin) {
-                newSkin.attachedDrawables.add(this);
+            this._skin = skin;
+            if (skin) {
+                skin.attachedDrawables.add(this);
             }
             this._skinWasAltered();
         }
