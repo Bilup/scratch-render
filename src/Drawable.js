@@ -451,7 +451,7 @@ class Drawable {
         }
 
         // Adjust rotation center relative to the skin.
-        if (this._rotationCenterDirty && this.skin !== null) {
+        if (this._rotationCenterDirty && this.skin) {
             // twgl version of the following in function work.
             // let rotationAdjusted = twgl.v3.subtract(
             //     this.skin.rotationCenter,
@@ -487,7 +487,7 @@ class Drawable {
             this._rotationCenterDirty = false;
         }
 
-        if (this._skinScaleDirty && this.skin !== null) {
+        if (this._skinScaleDirty && this.skin) {
             // twgl version of the following in function work.
             // const scaledSize = twgl.v3.divScalar(
             //     twgl.v3.multiply(this.skin.size, this._scale),
