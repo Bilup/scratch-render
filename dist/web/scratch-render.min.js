@@ -18580,6 +18580,17 @@ var Drawable = function () {
         this._rotationTransformDirty = true;
         this._rotationAdjusted = twgl.v3.create();
         this._rotationCenterDirty = true;
+        /**
+         * The Skin this Drawable is drawn with, or null when it has none.
+         * Assigned explicitly so the field is never undefined: the renderer's
+         * fence calculation reads it directly (see
+         * RenderWebGL.getFencedPositionOfDrawable), and undefined there is the
+         * difference between "no skin, nothing to clamp against" and a
+         * TypeError thrown out of Runtime._step.
+         * @type {?Skin}
+         * @private
+         */
+        this._skin = null;
         this._skinScale = twgl.v3.create(0, 0, 0);
         this._skinScaleDirty = true;
         this._inverseMatrix = twgl.m4.identity();
@@ -19354,13 +19365,20 @@ var Drawable = function () {
          */
         ,
         set: function set(newSkin) {
-            if (this._skin !== newSkin) {
+            // Normalise undefined to null. This field is read directly (not through
+            // the getter) by getFencedPositionOfDrawable, which only checks that the
+            // drawable exists -- so an undefined here is the difference between
+            // "no skin, nothing to fence against" and a TypeError thrown out of
+            // Runtime._step that stops the whole project. Every other consumer
+            // already treats a missing skin as falsy.
+            var skin = newSkin === undefined ? null : newSkin;
+            if (this._skin !== skin) {
                 if (this._skin) {
                     this._skin.attachedDrawables.delete(this);
                 }
-                this._skin = newSkin;
-                if (newSkin) {
-                    newSkin.attachedDrawables.add(this);
+                this._skin = skin;
+                if (skin) {
+                    skin.attachedDrawables.add(this);
                 }
                 this._skinWasAltered();
             }
@@ -22863,7 +22881,27 @@ var RenderWebGL = function (_EventEmitter) {
             var drawable = this._allDrawables[drawableID];
             // TODO: https://github.com/LLK/scratch-vm/issues/2288
             if (!drawable) return;
-            drawable.skin = this._allSkins[skinId];
+            var skin = this._allSkins[skinId];
+            // An id that no longer resolves is not a request to strip the skin off
+            // this drawable -- it is a stale id, and it is expected now.
+            //
+            // RenderedTarget.setCostume() and updateAllDrawableProperties() pass
+            // `costume.skinId` unconditionally, and that id can outlive the skin it
+            // names: releaseUnattachedSkins() (run from Runtime.dispose(), i.e. on
+            // every project load) deletes every skin no drawable is attached to.
+            // Assigning `undefined` here then left the drawable holding a skin
+            // property that is neither a Skin nor null, which
+            // getFencedPositionOfDrawable dereferences without a check -- so the
+            // next "go to x y" on that target threw out of Runtime._step and the
+            // project stopped moving.
+            //
+            // Keeping the current skin is the least surprising outcome: the drawable
+            // still renders (a disposed skin reports no texture, and _drawThese
+            // skips drawables with no texture), instead of becoming un-renderable
+            // and un-fenceable at the same time.
+            if (skin) {
+                drawable.skin = skin;
+            }
         }
 
         /**
@@ -23000,6 +23038,18 @@ var RenderWebGL = function (_EventEmitter) {
             if (!drawable) {
                 // @todo(https://github.com/LLK/scratch-vm/issues/2288) fix whatever's wrong in the VM which causes this, then add a warning or throw here.
                 // Right now this happens so much on some projects that a warning or exception here can hang the browser.
+                return [x, y];
+            }
+
+            // Same reasoning as the missing-drawable case above, and the same
+            // consequence if we do not: a drawable whose skin has gone away is a
+            // state the VM can still hand us (see updateDrawableSkinId -- a costume
+            // keeps its skinId across a project load while the skin itself is
+            // released by releaseUnattachedSkins). Clamping needs an AABB, and
+            // without a skin there is nothing to clamp against, so pass the
+            // position through. Throwing here aborts Runtime._step, which stops
+            // every script in the project, not just this one.
+            if (!drawable._skin) {
                 return [x, y];
             }
 
