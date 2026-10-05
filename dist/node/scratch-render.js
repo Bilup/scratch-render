@@ -705,25 +705,14 @@ var BitmapSkin = function (_Skin) {
             }
             var gl = this._renderer.gl;
 
-            // Renderer-side quality ceiling. A bitmap costume larger than the
-            // renderer's maximum texture dimension is uploaded at reduced texel
-            // density instead of at full resolution. This is the only ceiling a
-            // bitmap has ever had: SVGSkin clamps itself to the same value (see
-            // SVGSkin._materializeSVG) but bitmaps used to be uploaded at whatever
-            // size the project contained, so a single imported photo could cost
-            // tens of megabytes of GPU memory and again as much in the silhouette.
-            // Geometry is untouched -- see _clampBitmapSize -- so this only trades
-            // sharpness for memory, and only above the ceiling.
-            var clamped = BitmapSkin._clampBitmapSize(bitmapData, this._renderer.maxTextureDimension);
-
             // TW: We want to use <canvas> as-is because reading ImageData wastes memory.
             // However, vanilla LLK/scratch-vm will reuse any canvas that we get here for other costumes,
             // which will cause bugs when Silhouette lazily reads the canvas data.
             // TurboWarp/scratch-vm does not reuse canvases and will set canvas.reusable = false.
-            var textureData = clamped.data;
-            if (textureData instanceof HTMLCanvasElement && textureData.reusable !== false) {
-                var context = textureData.getContext('2d');
-                textureData = context.getImageData(0, 0, textureData.width, textureData.height);
+            var textureData = bitmapData;
+            if (bitmapData instanceof HTMLCanvasElement && bitmapData.reusable !== false) {
+                var context = bitmapData.getContext('2d');
+                textureData = context.getImageData(0, 0, bitmapData.width, bitmapData.height);
             }
 
             if (this._texture === null) {
@@ -739,11 +728,6 @@ var BitmapSkin = function (_Skin) {
 
             // Do these last in case any of the above throws an exception
             this._costumeResolution = costumeResolution || 2;
-            // Deliberately the ORIGINAL bitmap's size, not the size of the possibly
-            // downscaled texture: `size` is derived from this, and the drawable's
-            // rendered dimensions, the VM's costume.size and the stored
-            // bitmapResolution must all stay exactly as they were. The texture is
-            // simply stretched over the same quad at a lower texel density.
             this._textureSize = BitmapSkin._getBitmapSize(bitmapData);
 
             if (typeof rotationCenter === 'undefined') rotationCenter = this.calculateRotationCenter();
@@ -754,21 +738,8 @@ var BitmapSkin = function (_Skin) {
         }
 
         /**
-         * Downscale bitmap data until neither dimension exceeds `maxDimension`.
-         *
-         * Returns the input untouched when it already fits, which is the case for
-         * essentially every costume, so the common path is byte-for-byte what it
-         * was before.
-         *
-         * The returned bitmap is used both as the texture source and (lazily, via
-         * Skin._setTexture -> Silhouette.update) as the silhouette source, so both
-         * buffers shrink together. Downscaling the silhouette is safe because
-         * Silhouette samples it in normalised [0, 1] coordinates rather than in
-         * texels, so `touching?` keeps working, just with coarser precision.
-         *
-         * @param {ImageData|HTMLImageElement|HTMLCanvasElement|HTMLVideoElement} bitmapData - bitmap to inspect.
-         * @param {number} maxDimension - longest edge to allow, in texels. Falsy disables the ceiling.
-         * @returns {{data: object, scaled: boolean}} the uploadable bitmap, and whether it was resized
+         * @param {ImageData|HTMLImageElement|HTMLCanvasElement|HTMLVideoElement} bitmapData - bitmap data to inspect.
+         * @returns {Array<int>} the width and height of the bitmap data, in pixels.
          * @private
          */
 
@@ -778,48 +749,6 @@ var BitmapSkin = function (_Skin) {
             return [this._textureSize[0] / this._costumeResolution, this._textureSize[1] / this._costumeResolution];
         }
     }], [{
-        key: '_clampBitmapSize',
-        value: function _clampBitmapSize(bitmapData, maxDimension) {
-            if (!(maxDimension > 0)) {
-                return { data: bitmapData, scaled: false };
-            }
-
-            var sourceSize = BitmapSkin._getBitmapSize(bitmapData);
-            var longestEdge = Math.max(sourceSize[0], sourceSize[1]);
-            if (!(longestEdge > maxDimension)) {
-                return { data: bitmapData, scaled: false };
-            }
-
-            var ratio = maxDimension / longestEdge;
-            var width = Math.max(1, Math.round(sourceSize[0] * ratio));
-            var height = Math.max(1, Math.round(sourceSize[1] * ratio));
-
-            var canvas = document.createElement('canvas');
-            canvas.width = width;
-            canvas.height = height;
-            // Ours, and never handed to the VM's canvas pool: tells the branch below
-            // that it may upload the canvas directly instead of copying it into an
-            // ImageData first, and keeps the silhouette's lazy read valid.
-            canvas.reusable = false;
-            var context = canvas.getContext('2d');
-            context.imageSmoothingEnabled = true;
-            if ('imageSmoothingQuality' in context) {
-                context.imageSmoothingQuality = 'high';
-            }
-            // drawImage accepts every type in the signature except ImageData, and an
-            // ImageData source only appears for a VM-reused canvas, where the canvas
-            // itself is still available -- callers pass the canvas, not its pixels.
-            context.drawImage(bitmapData, 0, 0, width, height);
-            return { data: canvas, scaled: true };
-        }
-
-        /**
-         * @param {ImageData|HTMLImageElement|HTMLCanvasElement|HTMLVideoElement} bitmapData - bitmap data to inspect.
-         * @returns {Array<int>} the width and height of the bitmap data, in pixels.
-         * @private
-         */
-
-    }, {
         key: '_getBitmapSize',
         value: function _getBitmapSize(bitmapData) {
             if (bitmapData instanceof HTMLImageElement) {
@@ -963,17 +892,6 @@ var Drawable = function () {
         this._rotationTransformDirty = true;
         this._rotationAdjusted = twgl.v3.create();
         this._rotationCenterDirty = true;
-        /**
-         * The Skin this Drawable is drawn with, or null when it has none.
-         * Assigned explicitly so the field is never undefined: the renderer's
-         * fence calculation reads it directly (see
-         * RenderWebGL.getFencedPositionOfDrawable), and undefined there is the
-         * difference between "no skin, nothing to clamp against" and a
-         * TypeError thrown out of Runtime._step.
-         * @type {?Skin}
-         * @private
-         */
-        this._skin = null;
         this._skinScale = twgl.v3.create(0, 0, 0);
         this._skinScaleDirty = true;
         this._inverseMatrix = twgl.m4.identity();
@@ -1306,7 +1224,7 @@ var Drawable = function () {
             }
 
             // Adjust rotation center relative to the skin.
-            if (this._rotationCenterDirty && this.skin) {
+            if (this._rotationCenterDirty && this.skin !== null) {
                 // twgl version of the following in function work.
                 // let rotationAdjusted = twgl.v3.subtract(
                 //     this.skin.rotationCenter,
@@ -1342,7 +1260,7 @@ var Drawable = function () {
                 this._rotationCenterDirty = false;
             }
 
-            if (this._skinScaleDirty && this.skin) {
+            if (this._skinScaleDirty && this.skin !== null) {
                 // twgl version of the following in function work.
                 // const scaledSize = twgl.v3.divScalar(
                 //     twgl.v3.multiply(this.skin.size, this._scale),
@@ -1748,20 +1666,13 @@ var Drawable = function () {
          */
         ,
         set: function set(newSkin) {
-            // Normalise undefined to null. This field is read directly (not through
-            // the getter) by getFencedPositionOfDrawable, which only checks that the
-            // drawable exists -- so an undefined here is the difference between
-            // "no skin, nothing to fence against" and a TypeError thrown out of
-            // Runtime._step that stops the whole project. Every other consumer
-            // already treats a missing skin as falsy.
-            var skin = newSkin === undefined ? null : newSkin;
-            if (this._skin !== skin) {
+            if (this._skin !== newSkin) {
                 if (this._skin) {
                     this._skin.attachedDrawables.delete(this);
                 }
-                this._skin = skin;
-                if (skin) {
-                    skin.attachedDrawables.add(this);
+                this._skin = newSkin;
+                if (newSkin) {
+                    newSkin.attachedDrawables.add(this);
                 }
                 this._skinWasAltered();
             }
@@ -4015,66 +3926,8 @@ var RenderWebGL = function (_EventEmitter) {
         key: 'destroySkin',
         value: function destroySkin(skinId) {
             var oldSkin = this._allSkins[skinId];
-            // Tolerate a second call for a skin that is already gone. Scratch3Looks
-            // destroys a speech bubble's drawable and then its skin, and destroying
-            // the drawable already releases an orphaned skin (see destroyDrawable),
-            // so that second call must be a no-op rather than a TypeError.
-            if (!oldSkin) {
-                return;
-            }
             oldSkin.dispose();
             delete this._allSkins[skinId];
-        }
-
-        /**
-         * Destroy every skin that no drawable is currently attached to.
-         *
-         * A sprite owns a skin per costume but only ever has one drawable, so the
-         * costumes that are not currently selected -- normally most of a project's
-         * textures -- are unattached by construction and can never be reached by
-         * destroyDrawable(). Scratch-vm calls this from Runtime.dispose(), i.e. at
-         * the start of every project load, where the outgoing project's targets are
-         * all gone and its remaining skins are pure dead weight.
-         *
-         * Everything that has to outlive a project is still attached to a drawable
-         * nobody destroys, so the refcount alone keeps it: the pen layer and its
-         * stamp source (scratch3_pen) and the video preview layer (io/video). The
-         * pen skin is skipped by id as well, because the pen extension caches its
-         * id across projects and would otherwise be left holding a dead one.
-         */
-
-    }, {
-        key: 'releaseUnattachedSkins',
-        value: function releaseUnattachedSkins() {
-            var _iteratorNormalCompletion4 = true;
-            var _didIteratorError4 = false;
-            var _iteratorError4 = undefined;
-
-            try {
-                for (var _iterator4 = Object.keys(this._allSkins)[Symbol.iterator](), _step4; !(_iteratorNormalCompletion4 = (_step4 = _iterator4.next()).done); _iteratorNormalCompletion4 = true) {
-                    var skinId = _step4.value;
-
-                    var skin = this._allSkins[skinId];
-                    if (!skin) continue;
-                    if (skin.attachedDrawables.size !== 0) continue;
-                    if (Number(skinId) === this._penSkinId) continue;
-                    skin.dispose();
-                    delete this._allSkins[skinId];
-                }
-            } catch (err) {
-                _didIteratorError4 = true;
-                _iteratorError4 = err;
-            } finally {
-                try {
-                    if (!_iteratorNormalCompletion4 && _iterator4.return) {
-                        _iterator4.return();
-                    }
-                } finally {
-                    if (_didIteratorError4) {
-                        throw _iteratorError4;
-                    }
-                }
-            }
         }
 
         /**
@@ -4223,29 +4076,7 @@ var RenderWebGL = function (_EventEmitter) {
             }
             this.dirty = true;
             var drawable = this._allDrawables[drawableID];
-            // Grab the skin before disposing: the setter run by dispose() clears
-            // drawable.skin and unregisters this drawable from the skin.
-            var ownedSkin = drawable.skin;
             drawable.dispose();
-
-            // Release a skin that no drawable references any more.
-            //
-            // Without this, nothing ever destroys a costume's skin: every project
-            // load runs Runtime.dispose() -> RenderedTarget.dispose() ->
-            // destroyDrawable(), but the skin stayed in _allSkins (along with its GL
-            // texture and its equally large silhouette buffer) for the lifetime of
-            // the renderer. Loading project B after project A therefore cost A + B,
-            // and a third load cost A + B + C -- which is what makes opening a large
-            // project on Android drive the WebView renderer into an OOM crash.
-            //
-            // Costume switching does not come through here, so a skin that is merely
-            // not the selected costume keeps its texture. Clones share their
-            // original's skin, so the refcount only reaches zero when the last
-            // drawable using it is gone. The pen layer is excluded because the pen
-            // extension caches its skin id and expects it to outlive targets.
-            if (ownedSkin && ownedSkin.attachedDrawables.size === 0 && ownedSkin.id !== this._penSkinId) {
-                this.destroySkin(ownedSkin.id);
-            }
 
             var currentLayerGroup = this._layerGroups[group];
             var endIndex = this._endIndexForKnownLayerGroup(currentLayerGroup);
@@ -4378,27 +4209,27 @@ var RenderWebGL = function (_EventEmitter) {
     }, {
         key: 'skinWasAltered',
         value: function skinWasAltered(skin) {
-            var _iteratorNormalCompletion5 = true;
-            var _didIteratorError5 = false;
-            var _iteratorError5 = undefined;
+            var _iteratorNormalCompletion4 = true;
+            var _didIteratorError4 = false;
+            var _iteratorError4 = undefined;
 
             try {
-                for (var _iterator5 = skin.attachedDrawables[Symbol.iterator](), _step5; !(_iteratorNormalCompletion5 = (_step5 = _iterator5.next()).done); _iteratorNormalCompletion5 = true) {
-                    var drawable = _step5.value;
+                for (var _iterator4 = skin.attachedDrawables[Symbol.iterator](), _step4; !(_iteratorNormalCompletion4 = (_step4 = _iterator4.next()).done); _iteratorNormalCompletion4 = true) {
+                    var drawable = _step4.value;
 
                     drawable._skinWasAltered();
                 }
             } catch (err) {
-                _didIteratorError5 = true;
-                _iteratorError5 = err;
+                _didIteratorError4 = true;
+                _iteratorError4 = err;
             } finally {
                 try {
-                    if (!_iteratorNormalCompletion5 && _iterator5.return) {
-                        _iterator5.return();
+                    if (!_iteratorNormalCompletion4 && _iterator4.return) {
+                        _iterator4.return();
                     }
                 } finally {
-                    if (_didIteratorError5) {
-                        throw _iteratorError5;
+                    if (_didIteratorError4) {
+                        throw _iteratorError4;
                     }
                 }
             }
@@ -5264,27 +5095,7 @@ var RenderWebGL = function (_EventEmitter) {
             var drawable = this._allDrawables[drawableID];
             // TODO: https://github.com/LLK/scratch-vm/issues/2288
             if (!drawable) return;
-            var skin = this._allSkins[skinId];
-            // An id that no longer resolves is not a request to strip the skin off
-            // this drawable -- it is a stale id, and it is expected now.
-            //
-            // RenderedTarget.setCostume() and updateAllDrawableProperties() pass
-            // `costume.skinId` unconditionally, and that id can outlive the skin it
-            // names: releaseUnattachedSkins() (run from Runtime.dispose(), i.e. on
-            // every project load) deletes every skin no drawable is attached to.
-            // Assigning `undefined` here then left the drawable holding a skin
-            // property that is neither a Skin nor null, which
-            // getFencedPositionOfDrawable dereferences without a check -- so the
-            // next "go to x y" on that target threw out of Runtime._step and the
-            // project stopped moving.
-            //
-            // Keeping the current skin is the least surprising outcome: the drawable
-            // still renders (a disposed skin reports no texture, and _drawThese
-            // skips drawables with no texture), instead of becoming un-renderable
-            // and un-fenceable at the same time.
-            if (skin) {
-                drawable.skin = skin;
-            }
+            drawable.skin = this._allSkins[skinId];
         }
 
         /**
@@ -5421,18 +5232,6 @@ var RenderWebGL = function (_EventEmitter) {
             if (!drawable) {
                 // @todo(https://github.com/LLK/scratch-vm/issues/2288) fix whatever's wrong in the VM which causes this, then add a warning or throw here.
                 // Right now this happens so much on some projects that a warning or exception here can hang the browser.
-                return [x, y];
-            }
-
-            // Same reasoning as the missing-drawable case above, and the same
-            // consequence if we do not: a drawable whose skin has gone away is a
-            // state the VM can still hand us (see updateDrawableSkinId -- a costume
-            // keeps its skinId across a project load while the skin itself is
-            // released by releaseUnattachedSkins). Clamping needs an AABB, and
-            // without a skin there is nothing to clamp against, so pass the
-            // position through. Throwing here aborts Runtime._step, which stops
-            // every script in the project, not just this one.
-            if (!drawable._skin) {
                 return [x, y];
             }
 
@@ -6113,27 +5912,27 @@ var RenderWebGL = function (_EventEmitter) {
             // first time. We want to avoid that, so we'll ask the browser to load them right away.
             if ((typeof document === 'undefined' ? 'undefined' : _typeof(document)) === 'object' && _typeof(document.fonts) === 'object' && typeof document.fonts.load === 'function') {
                 var families = Object.keys(customFonts);
-                var _iteratorNormalCompletion6 = true;
-                var _didIteratorError6 = false;
-                var _iteratorError6 = undefined;
+                var _iteratorNormalCompletion5 = true;
+                var _didIteratorError5 = false;
+                var _iteratorError5 = undefined;
 
                 try {
-                    for (var _iterator6 = families[Symbol.iterator](), _step6; !(_iteratorNormalCompletion6 = (_step6 = _iterator6.next()).done); _iteratorNormalCompletion6 = true) {
-                        var family = _step6.value;
+                    for (var _iterator5 = families[Symbol.iterator](), _step5; !(_iteratorNormalCompletion5 = (_step5 = _iterator5.next()).done); _iteratorNormalCompletion5 = true) {
+                        var family = _step5.value;
 
                         document.fonts.load('12px ' + family);
                     }
                 } catch (err) {
-                    _didIteratorError6 = true;
-                    _iteratorError6 = err;
+                    _didIteratorError5 = true;
+                    _iteratorError5 = err;
                 } finally {
                     try {
-                        if (!_iteratorNormalCompletion6 && _iterator6.return) {
-                            _iterator6.return();
+                        if (!_iteratorNormalCompletion5 && _iterator5.return) {
+                            _iterator5.return();
                         }
                     } finally {
-                        if (_didIteratorError6) {
-                            throw _iteratorError6;
+                        if (_didIteratorError5) {
+                            throw _iteratorError5;
                         }
                     }
                 }
@@ -6421,11 +6220,7 @@ var SVGSkin = function (_Skin) {
 
             // Check if this is the largest MIP created so far. Currently, silhouettes only get scaled up.
             if (isLargestMIP) {
-                // Sample the silhouette from a reduced copy, for the same reason
-                // bitmap costumes do: the buffer is a second width * height * 4 bytes
-                // and 256 texels across is already finer than any touching? answer
-                // needs. See MAX_SILHOUETTE_DIMENSION in Skin.js.
-                this._silhouette.update(Skin._silhouetteSource(textureData));
+                this._silhouette.update(textureData);
                 this._largestMIPScale = scale;
             }
 
@@ -7070,26 +6865,6 @@ var Silhouette = function () {
             delete this.colorAtNearest;
             delete this.colorAtLinear;
         }
-
-        /**
-         * Drop the pixel data this silhouette holds.
-         *
-         * The buffer is width * height * 4 bytes -- exactly the same order of
-         * magnitude as the skin's GL texture -- and it is retained for the whole
-         * life of the skin, so releasing it matters as much as releasing the
-         * texture. Called from Skin.dispose(); the silhouette reports "touching
-         * nothing" afterwards, which is correct because a disposed skin must never
-         * be used again.
-         */
-
-    }, {
-        key: 'dispose',
-        value: function dispose() {
-            this._colorData = null;
-            this._lazyData = null;
-            this._width = 0;
-            this._height = 0;
-        }
     }, {
         key: 'unlazy',
         value: function unlazy() {
@@ -7234,371 +7009,300 @@ var twgl = __webpack_require__(/*! twgl.js */ "twgl.js");
 var RenderConstants = __webpack_require__(/*! ./RenderConstants */ "./src/RenderConstants.js");
 var Silhouette = __webpack_require__(/*! ./Silhouette */ "./src/Silhouette.js");
 
-/**
- * Longest edge, in texels, of the bitmap a silhouette is sampled from.
- *
- * A silhouette is a second width * height * 4 byte pixel buffer that lives
- * beside the texture, and it exists only to answer "is there ink near this
- * point". Silhouette samples it through normalised [0, 1] coordinates, so a
- * smaller buffer is exactly as correct -- just coarser -- and 256 texels across
- * a whole costume is already far finer than any touching? answer needs.
- *
- * Capping it matters for two reasons. The buffer itself is otherwise as large
- * as the texture; and because the silhouette only materialises lazily, every
- * costume that is not the one currently drawn used to pin the decoded bitmap it
- * was built from for the whole session, which on a large project is a second
- * full copy of every costume's pixels.
- * @const {number}
- */
-var MAX_SILHOUETTE_DIMENSION = 256;
-
 var Skin = function () {
+  /**
+   * Create a Skin, which stores and/or generates textures for use in rendering.
+   * @param {int} id - The unique ID for this Skin.
+   * @param {RenderWebGL} renderer - The renderer which will use this skin.
+   * @constructor
+   */
+  function Skin(id, renderer) {
+    _classCallCheck(this, Skin);
+
+    /** @type {RenderWebGL} */
+    this._renderer = renderer;
+
+    /** @type {int} */
+    this._id = id;
+
+    /** @type {Vec3} */
+    this._rotationCenter = twgl.v3.create(0, 0);
+
+    /** @type {WebGLTexture} */
+    this._texture = null;
+
     /**
-     * Create a Skin, which stores and/or generates textures for use in rendering.
-     * @param {int} id - The unique ID for this Skin.
-     * @param {RenderWebGL} renderer - The renderer which will use this skin.
-     * @constructor
+     * The uniforms to be used by the vertex and pixel shaders.
+     * Some of these are used by other parts of the renderer as well.
+     * @type {Object.<string,*>}
+     * @private
      */
-    function Skin(id, renderer) {
-        _classCallCheck(this, Skin);
+    this._uniforms = {
+      /**
+       * The nominal (not necessarily current) size of the current skin.
+       * @type {Array<number>}
+       */
+      u_skinSize: [0, 0],
 
-        /** @type {RenderWebGL} */
-        this._renderer = renderer;
+      /**
+       * The actual WebGL texture object for the skin.
+       * @type {WebGLTexture}
+       */
+      u_skin: null
+    };
 
-        /** @type {int} */
-        this._id = id;
+    /**
+     * A silhouette to store touching data, skins are responsible for keeping it up to date.
+     * @protected
+     */
+    this._silhouette = new Silhouette();
 
-        /** @type {Vec3} */
-        this._rotationCenter = twgl.v3.create(0, 0);
+    /**
+     * Whether this skin might include private information about the user.
+     */
+    this.private = false;
 
-        /** @type {WebGLTexture} */
-        this._texture = null;
+    /**
+     * Drawables currently using this skin, maintained by the Drawable skin setter.
+     * @type {Set<Drawable>}
+     */
+    this.attachedDrawables = new Set();
+  }
 
-        /**
-         * The uniforms to be used by the vertex and pixel shaders.
-         * Some of these are used by other parts of the renderer as well.
-         * @type {Object.<string,*>}
-         * @private
-         */
-        this._uniforms = {
-            /**
-             * The nominal (not necessarily current) size of the current skin.
-             * @type {Array<number>}
-             */
-            u_skinSize: [0, 0],
+  /**
+   * Dispose of this object. Do not use it after calling this method.
+   */
 
-            /**
-             * The actual WebGL texture object for the skin.
-             * @type {WebGLTexture}
-             */
-            u_skin: null
-        };
 
-        /**
-         * A silhouette to store touching data, skins are responsible for keeping it up to date.
-         * @protected
-         */
-        this._silhouette = new Silhouette();
-
-        /**
-         * Whether this skin might include private information about the user.
-         */
-        this.private = false;
-
-        /**
-         * Drawables currently using this skin, maintained by the Drawable skin setter.
-         * @type {Set<Drawable>}
-         */
-        this.attachedDrawables = new Set();
+  _createClass(Skin, [{
+    key: 'dispose',
+    value: function dispose() {
+      this._id = RenderConstants.ID_NONE;
     }
 
     /**
-     * Dispose of this object. Do not use it after calling this method.
+     * @return {int} the unique ID for this Skin.
      */
 
-
-    _createClass(Skin, [{
-        key: 'dispose',
-        value: function dispose() {
-            this._id = RenderConstants.ID_NONE;
-            // The silhouette holds a width * height * 4 byte pixel buffer, i.e. as
-            // much memory as the texture itself, and it is otherwise kept for the
-            // lifetime of the skin. Nothing may observe this skin after dispose(),
-            // so hand it back now instead of waiting for the whole skin object to
-            // become unreachable.
-            this._silhouette.dispose();
-        }
-
-        /**
-         * @return {int} the unique ID for this Skin.
-         */
-
-    }, {
-        key: 'useNearest',
+  }, {
+    key: 'useNearest',
 
 
-        /**
-         * Should this skin's texture be filtered with nearest-neighbor or linear interpolation at the given scale?
-         * @param {?Array<Number>} scale The screen-space X and Y scaling factors at which this skin's texture will be
-         * displayed, as percentages (100 means 1 "native size" unit is 1 screen pixel; 200 means 2 screen pixels, etc).
-         * @param {Drawable} drawable The drawable that this skin's texture will be applied to.
-         * @return {boolean} True if this skin's texture, as returned by {@link getTexture}, should be filtered with
-         * nearest-neighbor interpolation.
-         */
-        // eslint-disable-next-line no-unused-vars
-        value: function useNearest(scale, drawable) {
-            return true;
-        }
+    /**
+     * Should this skin's texture be filtered with nearest-neighbor or linear interpolation at the given scale?
+     * @param {?Array<Number>} scale The screen-space X and Y scaling factors at which this skin's texture will be
+     * displayed, as percentages (100 means 1 "native size" unit is 1 screen pixel; 200 means 2 screen pixels, etc).
+     * @param {Drawable} drawable The drawable that this skin's texture will be applied to.
+     * @return {boolean} True if this skin's texture, as returned by {@link getTexture}, should be filtered with
+     * nearest-neighbor interpolation.
+     */
+    // eslint-disable-next-line no-unused-vars
+    value: function useNearest(scale, drawable) {
+      return true;
+    }
 
-        /**
-         * Get the center of the current bounding box
-         * @return {Array<number>} the center of the current bounding box
-         */
+    /**
+     * Get the center of the current bounding box
+     * @return {Array<number>} the center of the current bounding box
+     */
 
-    }, {
-        key: 'calculateRotationCenter',
-        value: function calculateRotationCenter() {
-            return [this.size[0] / 2, this.size[1] / 2];
-        }
+  }, {
+    key: 'calculateRotationCenter',
+    value: function calculateRotationCenter() {
+      return [this.size[0] / 2, this.size[1] / 2];
+    }
 
-        /**
-         * @abstract
-         * @param {Array<number>} scale - The scaling factors to be used.
-         * @return {WebGLTexture} The GL texture representation of this skin when drawing at the given size.
-         */
-        // eslint-disable-next-line no-unused-vars
+    /**
+     * @abstract
+     * @param {Array<number>} scale - The scaling factors to be used.
+     * @return {WebGLTexture} The GL texture representation of this skin when drawing at the given size.
+     */
+    // eslint-disable-next-line no-unused-vars
 
-    }, {
-        key: 'getTexture',
-        value: function getTexture(scale) {
-            return this._emptyImageTexture;
-        }
+  }, {
+    key: 'getTexture',
+    value: function getTexture(scale) {
+      return this._emptyImageTexture;
+    }
 
-        /**
-         * Determine if the skin's size and rotation center properties are accurate.
-         * Default implementation returns true if getTexture([100, 100]) succeeds
-         * as this indicates that the skin is ready to be rendered. Child classes
-         * should override appropriately if getTexture() is known to be slow.
-         * @returns {boolean} true if size and rotation center are accurate.
-         */
+    /**
+     * Determine if the skin's size and rotation center properties are accurate.
+     * Default implementation returns true if getTexture([100, 100]) succeeds
+     * as this indicates that the skin is ready to be rendered. Child classes
+     * should override appropriately if getTexture() is known to be slow.
+     * @returns {boolean} true if size and rotation center are accurate.
+     */
 
-    }, {
-        key: 'isMetricsReady',
-        value: function isMetricsReady() {
-            return !!this.getTexture([100, 100]);
-        }
+  }, {
+    key: 'isMetricsReady',
+    value: function isMetricsReady() {
+      return !!this.getTexture([100, 100]);
+    }
 
-        /**
-         * Get the bounds of the drawable for determining its fenced position.
-         * @param {Array<number>} drawable - The Drawable instance this skin is using.
-         * @param {?Rectangle} result - Optional destination for bounds calculation.
-         * @return {!Rectangle} The drawable's bounds. For compatibility with Scratch 2, we always use getAABB.
-         */
+    /**
+     * Get the bounds of the drawable for determining its fenced position.
+     * @param {Array<number>} drawable - The Drawable instance this skin is using.
+     * @param {?Rectangle} result - Optional destination for bounds calculation.
+     * @return {!Rectangle} The drawable's bounds. For compatibility with Scratch 2, we always use getAABB.
+     */
 
-    }, {
-        key: 'getFenceBounds',
-        value: function getFenceBounds(drawable, result) {
-            return drawable.getAABB(result);
-        }
+  }, {
+    key: 'getFenceBounds',
+    value: function getFenceBounds(drawable, result) {
+      return drawable.getAABB(result);
+    }
 
-        /**
-         * Update and returns the uniforms for this skin.
-         * @param {Array<number>} scale - The scaling factors to be used.
-         * @returns {object.<string, *>} the shader uniforms to be used when rendering with this Skin.
-         */
+    /**
+     * Update and returns the uniforms for this skin.
+     * @param {Array<number>} scale - The scaling factors to be used.
+     * @returns {object.<string, *>} the shader uniforms to be used when rendering with this Skin.
+     */
 
-    }, {
-        key: 'getUniforms',
-        value: function getUniforms(scale) {
-            this._uniforms.u_skin = this.getTexture(scale);
-            this._uniforms.u_skinSize = this.size;
-            return this._uniforms;
-        }
-    }, {
-        key: 'emitWasAltered',
-        value: function emitWasAltered() {
-            this._renderer.skinWasAltered(this);
-        }
+  }, {
+    key: 'getUniforms',
+    value: function getUniforms(scale) {
+      this._uniforms.u_skin = this.getTexture(scale);
+      this._uniforms.u_skinSize = this.size;
+      return this._uniforms;
+    }
+  }, {
+    key: 'emitWasAltered',
+    value: function emitWasAltered() {
+      this._renderer.skinWasAltered(this);
+    }
 
-        /**
-         * If the skin defers silhouette operations until the last possible minute,
-         * this will be called before isTouching uses the silhouette.
-         */
+    /**
+     * If the skin defers silhouette operations until the last possible minute,
+     * this will be called before isTouching uses the silhouette.
+     */
 
-    }, {
-        key: 'updateSilhouette',
-        value: function updateSilhouette() {
-            this._silhouette.unlazy();
-        }
+  }, {
+    key: 'updateSilhouette',
+    value: function updateSilhouette() {
+      this._silhouette.unlazy();
+    }
 
-        /**
-         * Set this skin's texture to the given image.
-         * @param {ImageData|HTMLCanvasElement} textureData - The canvas or image data to set the texture to.
-         */
+    /**
+     * Set this skin's texture to the given image.
+     * @param {ImageData|HTMLCanvasElement} textureData - The canvas or image data to set the texture to.
+     */
 
-    }, {
-        key: '_setTexture',
-        value: function _setTexture(textureData) {
-            var gl = this._renderer.gl;
+  }, {
+    key: '_setTexture',
+    value: function _setTexture(textureData) {
+      var gl = this._renderer.gl;
 
-            // Go through the renderer so its record of what is bound to texture unit
-            // 0 stays accurate; a skin uploads its texture mid-draw when a MIP is
-            // created lazily.
-            this._renderer._bindTexture(this._texture);
-            // Premultiplied alpha is necessary for proper blending.
-            // See http://www.realtimerendering.com/blog/gpus-prefer-premultiplication/
-            gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, textureData);
-            gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      // Go through the renderer so its record of what is bound to texture unit
+      // 0 stays accurate; a skin uploads its texture mid-draw when a MIP is
+      // created lazily.
+      this._renderer._bindTexture(this._texture);
+      // Premultiplied alpha is necessary for proper blending.
+      // See http://www.realtimerendering.com/blog/gpus-prefer-premultiplication/
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, textureData);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
 
-            this._silhouette.update(Skin._silhouetteSource(textureData));
-        }
+      this._silhouette.update(textureData);
+    }
 
-        /**
-         * Build the bitmap the silhouette is sampled from, at most
-         * MAX_SILHOUETTE_DIMENSION texels on its longest edge.
-         *
-         * Returns the input untouched when it is already small enough. Otherwise a
-         * reduced copy is returned, which is what keeps the lazily-retained
-         * silhouette source down to kilobytes: Silhouette stores whatever it is
-         * handed and only reads it on first use, so handing it the full-resolution
-         * costume would pin the decoded bitmap of every costume in the project.
-         *
-         * @param {ImageData|HTMLImageElement|HTMLCanvasElement|HTMLVideoElement} textureData - uploaded texture source
-         * @returns {ImageData|HTMLCanvasElement} the bitmap to sample the silhouette from
-         * @private
-         */
+    /**
+     * Set the contents of this skin to an empty skin.
+     * @fires Skin.event:WasAltered
+     */
 
-    }, {
-        key: 'setEmptyImageData',
+  }, {
+    key: 'setEmptyImageData',
+    value: function setEmptyImageData() {
+      // Free up the current reference to the _texture
+      this._texture = null;
 
+      if (!this._emptyImageData) {
+        // Create a transparent pixel
+        this._emptyImageData = new ImageData(1, 1);
 
-        /**
-         * Set the contents of this skin to an empty skin.
-         * @fires Skin.event:WasAltered
-         */
-        value: function setEmptyImageData() {
-            // Free up the current reference to the _texture
-            this._texture = null;
+        // Create a new texture and update the silhouette
+        var gl = this._renderer.gl;
 
-            if (!this._emptyImageData) {
-                // Create a transparent pixel
-                this._emptyImageData = new ImageData(1, 1);
+        var textureOptions = {
+          auto: true,
+          wrap: gl.CLAMP_TO_EDGE,
+          src: this._emptyImageData
+        };
 
-                // Create a new texture and update the silhouette
-                var gl = this._renderer.gl;
+        // Note: we're using _emptyImageTexture here instead of _texture
+        // so that we can cache this empty texture for later use as needed.
+        // this._texture can get modified by other skins (e.g. BitmapSkin
+        // and SVGSkin, so we can't use that same field for caching)
+        this._emptyImageTexture = twgl.createTexture(gl, textureOptions);
+      }
 
-                var textureOptions = {
-                    auto: true,
-                    wrap: gl.CLAMP_TO_EDGE,
-                    src: this._emptyImageData
-                };
+      this._rotationCenter[0] = 0;
+      this._rotationCenter[1] = 0;
 
-                // Note: we're using _emptyImageTexture here instead of _texture
-                // so that we can cache this empty texture for later use as needed.
-                // this._texture can get modified by other skins (e.g. BitmapSkin
-                // and SVGSkin, so we can't use that same field for caching)
-                this._emptyImageTexture = twgl.createTexture(gl, textureOptions);
-            }
+      this._silhouette.update(this._emptyImageData);
+      this.emitWasAltered();
+    }
 
-            this._rotationCenter[0] = 0;
-            this._rotationCenter[1] = 0;
+    /**
+     * Does this point touch an opaque or translucent point on this skin?
+     * Nearest Neighbor version
+     * The caller is responsible for ensuring this skin's silhouette is up-to-date.
+     * @see updateSilhouette
+     * @see Drawable.updateCPURenderAttributes
+     * @param {twgl.v3} vec A texture coordinate.
+     * @return {boolean} Did it touch?
+     */
 
-            this._silhouette.update(this._emptyImageData);
-            this.emitWasAltered();
-        }
+  }, {
+    key: 'isTouchingNearest',
+    value: function isTouchingNearest(vec) {
+      return this._silhouette.isTouchingNearest(vec);
+    }
 
-        /**
-         * Does this point touch an opaque or translucent point on this skin?
-         * Nearest Neighbor version
-         * The caller is responsible for ensuring this skin's silhouette is up-to-date.
-         * @see updateSilhouette
-         * @see Drawable.updateCPURenderAttributes
-         * @param {twgl.v3} vec A texture coordinate.
-         * @return {boolean} Did it touch?
-         */
+    /**
+     * Does this point touch an opaque or translucent point on this skin?
+     * Linear Interpolation version
+     * The caller is responsible for ensuring this skin's silhouette is up-to-date.
+     * @see updateSilhouette
+     * @see Drawable.updateCPURenderAttributes
+     * @param {twgl.v3} vec A texture coordinate.
+     * @return {boolean} Did it touch?
+     */
 
-    }, {
-        key: 'isTouchingNearest',
-        value: function isTouchingNearest(vec) {
-            return this._silhouette.isTouchingNearest(vec);
-        }
+  }, {
+    key: 'isTouchingLinear',
+    value: function isTouchingLinear(vec) {
+      return this._silhouette.isTouchingLinear(vec);
+    }
+  }, {
+    key: 'id',
+    get: function get() {
+      return this._id;
+    }
 
-        /**
-         * Does this point touch an opaque or translucent point on this skin?
-         * Linear Interpolation version
-         * The caller is responsible for ensuring this skin's silhouette is up-to-date.
-         * @see updateSilhouette
-         * @see Drawable.updateCPURenderAttributes
-         * @param {twgl.v3} vec A texture coordinate.
-         * @return {boolean} Did it touch?
-         */
+    /**
+     * @returns {Vec3} the origin, in object space, about which this Skin should rotate.
+     */
 
-    }, {
-        key: 'isTouchingLinear',
-        value: function isTouchingLinear(vec) {
-            return this._silhouette.isTouchingLinear(vec);
-        }
-    }, {
-        key: 'id',
-        get: function get() {
-            return this._id;
-        }
+  }, {
+    key: 'rotationCenter',
+    get: function get() {
+      return this._rotationCenter;
+    }
 
-        /**
-         * @returns {Vec3} the origin, in object space, about which this Skin should rotate.
-         */
+    /**
+     * @abstract
+     * @return {Array<number>} the "native" size, in texels, of this skin.
+     */
 
-    }, {
-        key: 'rotationCenter',
-        get: function get() {
-            return this._rotationCenter;
-        }
+  }, {
+    key: 'size',
+    get: function get() {
+      return [0, 0];
+    }
+  }]);
 
-        /**
-         * @abstract
-         * @return {Array<number>} the "native" size, in texels, of this skin.
-         */
-
-    }, {
-        key: 'size',
-        get: function get() {
-            return [0, 0];
-        }
-    }], [{
-        key: '_silhouetteSource',
-        value: function _silhouetteSource(textureData) {
-            var width = textureData.width;
-            var height = textureData.height;
-            var longestEdge = Math.max(width, height);
-            if (!(longestEdge > MAX_SILHOUETTE_DIMENSION)) {
-                return textureData;
-            }
-
-            var ratio = MAX_SILHOUETTE_DIMENSION / longestEdge;
-            var targetWidth = Math.max(1, Math.round(width * ratio));
-            var targetHeight = Math.max(1, Math.round(height * ratio));
-
-            var canvas = document.createElement('canvas');
-            canvas.width = targetWidth;
-            canvas.height = targetHeight;
-            var context = canvas.getContext('2d');
-            if (textureData instanceof ImageData) {
-                // drawImage rejects ImageData, so stage it 1:1 first. Rare: only the
-                // VM's reused canvases reach here as ImageData.
-                var staging = document.createElement('canvas');
-                staging.width = width;
-                staging.height = height;
-                staging.getContext('2d').putImageData(textureData, 0, 0);
-                context.drawImage(staging, 0, 0, targetWidth, targetHeight);
-            } else {
-                context.drawImage(textureData, 0, 0, targetWidth, targetHeight);
-            }
-            return canvas;
-        }
-    }]);
-
-    return Skin;
+  return Skin;
 }();
 
 module.exports = Skin;
