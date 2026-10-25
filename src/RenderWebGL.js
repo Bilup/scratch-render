@@ -907,29 +907,30 @@ class RenderWebGL extends EventEmitter {
         }
         this.dirty = true;
         const drawable = this._allDrawables[drawableID];
-        // Grab the skin before disposing: the setter run by dispose() clears
-        // drawable.skin and unregisters this drawable from the skin.
-        const ownedSkin = drawable.skin;
         drawable.dispose();
 
-        // Release a skin that no drawable references any more.
+        // A skin is owned by the costume that created it, not by the drawable
+        // that happens to be showing it, so destroying this drawable must not
+        // release the skin.
         //
-        // Without this, nothing ever destroys a costume's skin: every project
-        // load runs Runtime.dispose() -> RenderedTarget.dispose() ->
-        // destroyDrawable(), but the skin stayed in _allSkins (along with its GL
-        // texture and its equally large silhouette buffer) for the lifetime of
-        // the renderer. Loading project B after project A therefore cost A + B,
-        // and a third load cost A + B + C -- which is what makes opening a large
-        // project on Android drive the WebView renderer into an OOM crash.
+        // Releasing on refcount zero here is wrong because of clones. A sprite
+        // has exactly one drawable per target, and every target can show a
+        // different costume. Delete a clone that was wearing costume B while
+        // the original wears costume A and B's refcount drops to zero -- but B
+        // is still a live costume of the sprite, and `costume.skinId` still
+        // holds B's id. Skin ids are handed out by a monotonic counter and are
+        // never reused, so that id can never resolve again: the next clone to
+        // select costume B hands the renderer a dead id, updateDrawableSkinId()
+        // finds no such skin and leaves the drawable alone, and the clone keeps
+        // rendering its parent's costume A while currentCostume says B. That is
+        // the "clones lose their costume on the second run" bug.
         //
-        // Costume switching does not come through here, so a skin that is merely
-        // not the selected costume keeps its texture. Clones share their
-        // original's skin, so the refcount only reaches zero when the last
-        // drawable using it is gone. The pen layer is excluded because the pen
-        // extension caches its skin id and expects it to outlive targets.
-        if (ownedSkin && ownedSkin.attachedDrawables.size === 0 && ownedSkin.id !== this._penSkinId) {
-            this.destroySkin(ownedSkin.id);
-        }
+        // Skins are instead released by releaseUnattachedSkins(), which
+        // scratch-vm calls from Runtime.dispose() -- once per project load, at
+        // a point where every target of the outgoing project is already gone
+        // and its costumes are unreachable. That is the same reclamation with
+        // none of the false positives, and it is what keeps loading project B
+        // after project A from costing A + B (the Android WebView OOM).
 
         const currentLayerGroup = this._layerGroups[group];
         const endIndex = this._endIndexForKnownLayerGroup(currentLayerGroup);
