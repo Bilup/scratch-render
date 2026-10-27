@@ -6469,7 +6469,15 @@ var SVGSkin = function (_Skin) {
             var mipScale = Math.pow(2, mipLevel - INDEX_OFFSET);
 
             if (this._svgImageLoaded && !this._scaledMIPs[mipLevel]) {
-                this._scaledMIPs[mipLevel] = this.createMIP(mipScale);
+                var mip = this.createMIP(mipScale);
+                // createMIP() gives up on an image that is too small to draw -- it
+                // returns the skin's shared empty texture rather than a texture of
+                // its own. Caching that would put the shared texture in _scaledMIPs,
+                // where resetMIPs() would delete it and leave every later fallback
+                // of this skin pointing at a dead GL texture.
+                if (mip !== _get(SVGSkin.prototype.__proto__ || Object.getPrototypeOf(SVGSkin.prototype), 'getTexture', this).call(this)) {
+                    this._scaledMIPs[mipLevel] = mip;
+                }
             }
 
             return this._scaledMIPs[mipLevel] || _get(SVGSkin.prototype.__proto__ || Object.getPrototypeOf(SVGSkin.prototype), 'getTexture', this).call(this);
@@ -6532,7 +6540,20 @@ var SVGSkin = function (_Skin) {
             // expensive half of setSVG. Skins are created for every costume of a
             // project but only drawn costumes need a texture, so by default it is left
             // to _materializeSVG() to do that on first use.
-            if (!DEFER_SVG_MATERIALIZATION) this._materializeSVG();
+            //
+            // "On first use" is not reached for a costume edited while the stage is
+            // idle, though. getTexture() is only called from a draw, draw() returns
+            // early unless the renderer is dirty, and the one thing that marks it dirty
+            // is the `WasAltered` event of the image load that has not started yet --
+            // a closed loop. The edit then sits invisible until something unrelated
+            // asks this skin for a texture, which is exactly what selecting the sprite
+            // does (the highlight reads its bounds, which reads the silhouette, which
+            // calls getTexture()). A skin that already has a drawable is on screen by
+            // definition, so start the load now; costumes nobody is showing keep the
+            // deferral.
+            if (!DEFER_SVG_MATERIALIZATION || this.attachedDrawables.size > 0) {
+                this._materializeSVG();
+            }
         }
 
         /**
@@ -6567,6 +6588,19 @@ var SVGSkin = function (_Skin) {
             // If there is another load already in progress, replace the old onload to effectively cancel the old load
             this._svgImage.onload = function () {
                 if (width === 0 || height === 0) {
+                    // An emptied costume. The MIPs from its previous, non-empty
+                    // version are still here and getTexture() prefers them over
+                    // the empty texture, so without this the old artwork would
+                    // stay on the stage no matter what.
+                    //
+                    // `_svgImageLoaded` stays false on purpose. It only gates MIP
+                    // creation, and createMIP() cannot build one for a zero-sized
+                    // image: it returns the skin's shared empty texture instead,
+                    // which caching in _scaledMIPs would then hand to resetMIPs()
+                    // to delete -- leaving every later fallback of this skin
+                    // pointing at a dead GL texture. With it false, getTexture()
+                    // returns that empty texture directly and caches nothing.
+                    _this3.resetMIPs();
                     _get(SVGSkin.prototype.__proto__ || Object.getPrototypeOf(SVGSkin.prototype), 'setEmptyImageData', _this3).call(_this3);
                     return;
                 }
